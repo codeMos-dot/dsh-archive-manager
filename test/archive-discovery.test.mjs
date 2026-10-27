@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractConversation, findContentMatch, previewConversation, matchesUpdatedRange, searchArchiveBatches, searchInputSchema } from "../src/archive-discovery.ts";
+import { extractConversation, findContentMatch, previewConversation, matchesUpdatedRange, searchArchiveBatches, searchInputSchema, mapSettledConcurrent } from "../src/archive-discovery.ts";
 const user = (seq, text) => ({ type: "user/message", seq, data: { role: "user", content: [{ type: "text", text }] } });
 const assistant = (seq, text) => ({ type: "assistant/message", seq, data: { message: { role: "assistant", content: [{ type: "text", text }] } } });
 
@@ -64,6 +64,23 @@ test("分批搜索不截断末页，取消后不继续下一批，读取失败�
   await assert.rejects(searchArchiveBatches(ids, "订单", async () => { count++; controller.abort(); return { items: [], failures: [] }; }, { signal: controller.signal }), /取消/);
   assert.equal(count, 1);
   await assert.rejects(searchArchiveBatches(ids, "订单", async () => { throw new Error("读取失败"); }), /读取失败/);
+});
+test("有界并发按输入顺序返回，单条失败不中断其余读取", async () => {
+  const ids = ["a", "b", "c", "d", "e"];
+  let active = 0, maxActive = 0;
+  const results = await mapSettledConcurrent(ids, 2, async (id, index) => {
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    active--;
+    if (id === "c") throw new Error("读取失败");
+    return `${id}:${index}`;
+  });
+  assert.equal(maxActive, 2);
+  assert.deepEqual(results.map(result => result.status), ["fulfilled", "fulfilled", "rejected", "fulfilled", "fulfilled"]);
+  assert.deepEqual(results.map(result => result.status === "fulfilled" ? result.value : undefined), ["a:0", "b:1", undefined, "d:3", "e:4"]);
+  assert.match(results[2].reason.message, /读取失败/);
+  await assert.rejects(mapSettledConcurrent([], 0, async () => undefined), /并发数/);
 });
 test("搜索参数限制批量大小、关键词和会话 ID，防止无限请求", () => {
   assert.throws(() => searchInputSchema.parse({ sessionIds: Array(21).fill("a"), query: "x" }));

@@ -2,6 +2,7 @@ import type * as React from "react";
 import type { CacheDiagnosis, CacheRebuildResult, CacheCandidate } from "./cache-rebuild-contract.js";
 import type { SessionSummary, BatchResult, BatchProgress, OrganizeKind, OrganizeOptions, Translate } from "./contracts.js";
 import type { ArchivePreviewResult } from "./archive-discovery.js";
+import type { TrashBatch, TrashList, TrashPurgeResult, TrashRestoreResult } from "./archive-store-contract.js";
 
 /** 给预编译 JSX 调用补回属性与事件上下文，运行时仍使用宿主的 jsx-runtime。 */
 interface TypedJsx {
@@ -60,6 +61,11 @@ export interface ArchiveProps {
   unarchiveSession(id: string): Promise<unknown>; deleteSession(id: string): Promise<unknown>;
   unarchiveSessions(target: BatchTarget): Promise<{ unarchivedSessionIds: string[]; failures?: { sessionId: string; message: string }[] }>;
   deleteArchivedSessions(target: BatchTarget): Promise<DeletedBatch>;
+  trashSession?(id: string): Promise<{ trashed: true }>;
+  trashArchivedSessions?(target: BatchTarget): Promise<TrashBatch>;
+  trashedSessions?(): Promise<TrashList>;
+  restoreTrashedSessions?(input: { sessionIds: string[] }): Promise<TrashRestoreResult>;
+  purgeTrashedSessions?(input: { all: true } | { sessionIds: string[] }): Promise<TrashPurgeResult>;
   archivedSessionMetadata(): Promise<{ items: { sessionId: string; createdAt: number }[] }>;
   openConversation(id: string): unknown; focusSessionWorkspace?(id: string): Promise<unknown>;
   viewState?: { query?: string; project?: string; sortBy?: string }; close?(): void; t: Translate;

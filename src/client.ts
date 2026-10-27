@@ -12,6 +12,8 @@ import { cacheRebuildInvocations } from "./cache-rebuild-contract.js";
 import type { CacheDiagnosis } from "./cache-rebuild-contract.js";
 import { createCacheRebuildController } from "./cache-rebuild-client.js";
 import type { CacheRepairState } from "./cache-rebuild-client.js";
+import { trashInvocations } from "./archive-store-contract.js";
+import type { TrashBatch, TrashEntry, TrashList, TrashPurgeResult, TrashRestoreResult } from "./archive-store-contract.js";
 import { allowArchivedNavigation, openArchivedConversation, formatArchiveNavigationError, ArchiveNavigationError, currentSessionId } from "./archive-experience.js";
 import { observePluginUpdate } from "./plugin-update-ui.js";
 import { setupSidebarEntry } from "./sidebar-entry.js";
@@ -21,6 +23,8 @@ import { createOrganizerPanel, organizerZh, organizerEn, organizerRu } from "./a
 import { createPortal } from "react-dom";
 import { SelectionCheckbox } from "./plugin-ui.js";
 type HostRequire = Parameters<Window["__ModuleLoader__"]["load"]>[0]["factory"] extends (require: infer Require) => unknown ? Require : never;
+/** 大会话列表首次只渲染一批，其余由用户按批展开。 */
+export const ARCHIVE_RENDER_BATCH = 200;
 export function startArchiveClient(require: HostRequire) {
 		var module: { exports: Record<string, unknown> } = { exports: {} };
 		var exports = module.exports;
@@ -236,6 +240,7 @@ export function startArchiveClient(require: HostRequire) {
 				...favoriteInvocations(),
 				...discoveryInvocations(),
 				...cacheRebuildInvocations(),
+				...trashInvocations({ sessionId: sessionIdSchema, batchTarget: archivedBatchTargetSchema }),
 				{
 					id: "@michengai/dsh-archive-manager#workspaceRegistry/unarchiveSession",
 					service: "workspaceRegistry",
@@ -928,7 +933,7 @@ export function startArchiveClient(require: HostRequire) {
 		/**
 		* 归档管理设置页：集中处理筛选、多选、恢复、删除和原生会话导航。
 		*/
-		function ArchivedSessionsSection({ archiveSessions, archiveSession, sessionStore, workspaceStore, unarchiveSession, deleteSession, unarchiveSessions, deleteArchivedSessions, archivedSessionMetadata, openConversation, focusSessionWorkspace, viewState, close, t, diagnoseOrphanSubagents, cleanOrphanSubagents, diagnoseSessionCaches, rebuildSessionCaches, refreshCacheLists, searchSessionContent, searchArchivedContent, previewArchivedSession, favoriteSessions, setSessionFavorite, favoriteSync, organizeBatch, useSessionPendingInteraction, useSessionStatus }: ArchiveProps) {
+		function ArchivedSessionsSection({ archiveSessions, archiveSession, sessionStore, workspaceStore, unarchiveSession, deleteSession, unarchiveSessions, deleteArchivedSessions, archivedSessionMetadata, openConversation, focusSessionWorkspace, viewState, close, t, diagnoseOrphanSubagents, cleanOrphanSubagents, diagnoseSessionCaches, rebuildSessionCaches, refreshCacheLists, searchSessionContent, searchArchivedContent, previewArchivedSession, favoriteSessions, setSessionFavorite, favoriteSync, organizeBatch, trashedSessions, restoreTrashedSessions, purgeTrashedSessions, useSessionPendingInteraction, useSessionStatus }: ArchiveProps) {
 			const sessions = (0, react.useSyncExternalStore)(sessionStore.subscribe, sessionStore.getSnapshot);
 			const workspaceState = (0, react.useSyncExternalStore)(workspaceStore.subscribe, workspaceStore.getSnapshot);
 			const [archiveTab, setArchiveTab] = (0, react.useState)("archived");
@@ -968,10 +973,22 @@ export function startArchiveClient(require: HostRequire) {
 			const [lastArchive, setLastArchive] = (0, react.useState)<string[]>([]);
 			const batchLock = (0, react.useRef)(false);
 			const retryBatch = (0, react.useRef)<ArchiveRetry | null>(null);
+			const [renderedCounts, setRenderedCounts] = (0, react.useState)<Record<string, number>>({});
+			const [trashOpen, setTrashOpen] = (0, react.useState)(false);
+			const [trashList, setTrashList] = (0, react.useState)<TrashList | null>(null);
+			const [trashSelected, setTrashSelected] = (0, react.useState)<string[]>([]);
+			const [trashLoading, setTrashLoading] = (0, react.useState)(false);
+			const [trashBusy, setTrashBusy] = (0, react.useState)(false);
+			const [trashError, setTrashError] = (0, react.useState)<string | null>(null);
+			const [trashNotice, setTrashNotice] = (0, react.useState)<string | null>(null);
+			const [trashConfirm, setTrashConfirm] = (0, react.useState)<{ sessionIds: string[] | null; count: number } | null>(null);
 			const uiFacts = useSessionUiFacts(useSessionPendingInteraction ?? useEmptySessionPendingInteraction, useSessionStatus ?? useEmptySessionStatus, typeof useSessionStatus === "function");
 			const pendingRef = (0, react.useRef)(uiFacts.pending);
 			pendingRef.current = uiFacts.pending;
 			const favoriteSet = (0, react.useMemo)(() => new Set(favoriteIds), [favoriteIds]);
+			const trashSelectionSet = (0, react.useMemo)(() => new Set(trashSelected), [trashSelected]);
+			const trashAvailable = typeof trashedSessions === "function" && typeof restoreTrashedSessions === "function" && typeof purgeTrashedSessions === "function";
+			(0, react.useEffect)(() => { setRenderedCounts({}); }, [query, project, sortBy, archiveTab, searchScope, dateFrom, dateTo]);
 			const loadFavorites = async () => {
 				if (!favoriteSessions) return;
 				try { const result = await favoriteSessions(); setFavoriteIds(result.favoriteSessionIds); setFavoritesReady(true); favoriteSync?.adopt(result.favoriteSessionIds); }
@@ -994,6 +1011,62 @@ export function startArchiveClient(require: HostRequire) {
 				try { const value = await setSessionFavorite({ sessionId, favorite: !favoriteSet.has(sessionId) }); setFavoriteIds(value.favoriteSessionIds); favoriteSync?.adopt(value.favoriteSessionIds); }
 				catch (reason) { setError(errorMessage(reason)); }
 				finally { favoriteLock.current = false; setFavoriteBusy(false); }
+			};
+			const readTrash = async () => {
+				if (typeof trashedSessions !== "function") throw new Error("当前宿主不支持回收站");
+				const next = await trashedSessions();
+				setTrashList(next);
+				setTrashSelected((previous) => previous.filter((sessionId) => next.items.some((item) => item.sessionId === sessionId)));
+				return next;
+			};
+			const loadTrash = async () => {
+				if (typeof trashedSessions !== "function") return;
+				setTrashLoading(true); setTrashError(null);
+				try { await readTrash(); }
+				catch (reason) { setTrashError(t("trash.failed", { detail: errorMessage(reason) })); }
+				finally { setTrashLoading(false); }
+			};
+			const openTrash = () => {
+				if (!trashAvailable) return;
+				setTrashError(null); setTrashNotice(null); setTrashOpen(true); void loadTrash();
+			};
+			const closeTrash = () => { if (!trashBusy) { setTrashOpen(false); setTrashConfirm(null); } };
+			const toggleTrashSelection = (sessionId: string, selected: boolean) => setTrashSelected((previous) => selected ? [...new Set([...previous, sessionId])] : previous.filter((id) => id !== sessionId));
+			const toggleAllTrash = (selected: boolean) => setTrashSelected(selected ? (trashList?.items.map((item) => item.sessionId) ?? []) : []);
+			const requestTrashPurge = (sessionIds: string[] | null) => {
+				const count = sessionIds === null ? (trashList?.items.length ?? 0) : sessionIds.length;
+				if (count === 0 || trashBusy) return;
+				setTrashError(null); setTrashNotice(null); setTrashConfirm({ sessionIds, count });
+			};
+			const restoreSelectedTrash = async () => {
+				if (trashBusy || trashSelected.length === 0 || typeof restoreTrashedSessions !== "function") return;
+				setTrashBusy(true); setTrashError(null); setTrashNotice(null);
+				try {
+					const result = await restoreTrashedSessions({ sessionIds: trashSelected });
+					const completed = new Set([...result.restoredSessionIds, ...result.skippedSessionIds]);
+					setTrashSelected((previous) => previous.filter((id) => !completed.has(id)));
+					if (result.failures.length > 0) setTrashError(t("trash.partial", { done: completed.size, failed: result.failures.length, detail: result.failures.map((item) => item.message).join("; ").slice(0, 500) }));
+					else setTrashNotice(t("trash.restoreSuccess", { n: result.restoredSessionIds.length }));
+					try { await readTrash(); }
+					catch (reason) { setTrashError(t("trash.failed", { detail: errorMessage(reason) })); }
+				} catch (reason) { setTrashError(t("trash.failed", { detail: errorMessage(reason) })); }
+				finally { setTrashBusy(false); }
+			};
+			const purgeTrash = async () => {
+				if (trashConfirm === null || trashBusy || typeof purgeTrashedSessions !== "function") return;
+				const input = trashConfirm.sessionIds === null ? { all: true as const } : { sessionIds: trashConfirm.sessionIds };
+				setTrashBusy(true); setTrashError(null); setTrashNotice(null);
+				try {
+					const result = await purgeTrashedSessions(input);
+					const purged = new Set(result.purgedSessionIds);
+					setTrashSelected((previous) => previous.filter((id) => !purged.has(id)));
+					if (result.failures.length > 0) setTrashError(t("trash.partial", { done: result.purgedSessionIds.length, failed: result.failures.length, detail: result.failures.map((item) => item.message).join("; ").slice(0, 500) }));
+					else setTrashNotice(t("trash.purgeSuccess", { n: result.purgedSessionIds.length }));
+					setTrashConfirm(null);
+					try { await readTrash(); }
+					catch (reason) { setTrashError(t("trash.failed", { detail: errorMessage(reason) })); }
+				} catch (reason) { setTrashError(t("trash.failed", { detail: errorMessage(reason) })); }
+				finally { setTrashBusy(false); }
 			};
 			const executeBatch = async (kind: OrganizeKind, ids: string[], { idle = false, retry = false } = {}) => {
 				if (batchLock.current || favoriteLock.current || unarchivingSessionIdsRef.current.size > 0 || !organizeBatch) return;
@@ -1332,11 +1405,11 @@ export function startArchiveClient(require: HostRequire) {
 			return (0, react_jsx_runtime.jsxs)("section", {
 				className: "dsham_settings",
 				"aria-label": t("archives.title"),
-				children: [(0, react_jsx_runtime.jsx)("style", { children: ARCHIVE_TABS_CSS + ARCHIVE_SETTINGS_CSS + ARCHIVE_SETTINGS_BATCH_CSS + ARCHIVE_SETTINGS_EXTERNAL_LINK_CSS + ARCHIVE_SETTINGS_SELECTION_CSS }), (0, react_jsx_runtime.jsxs)("div", {
+				children: [(0, react_jsx_runtime.jsx)("style", { children: ARCHIVE_TABS_CSS + ARCHIVE_SETTINGS_CSS + ARCHIVE_SETTINGS_BATCH_CSS + ARCHIVE_SETTINGS_EXTERNAL_LINK_CSS + ARCHIVE_SETTINGS_SELECTION_CSS + ARCHIVE_SETTINGS_TRASH_CSS }), (0, react_jsx_runtime.jsxs)("div", {
 					// 设置页使用独立布局容器，避免被 Codex UI 的会话 header 页签适配器识别。
 					className: "dsham_settingsHeader",
 					children: [(0, react_jsx_runtime.jsxs)("div", {
-					children: [(0, react_jsx_runtime.jsxs)("div", { className: "dsham_settingsTitleRow", children: [(0, react_jsx_runtime.jsx)("h2", { children: t("archives.title") }), (0, react_jsx_runtime.jsxs)("div", { className: "dsham_settingsLinks", children: [(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, { variant: "outline", size: "sm", "aria-label": t("archives.viewProject"), icon: (0, react_jsx_runtime.jsx)(GithubMark16, {}), onClick: () => window.open("https://github.com/MichengAI/dsh-archive-manager", "_blank", "noreferrer"), children: t("archives.viewProject") }), (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, { variant: "outline", size: "sm", "aria-label": t("archives.feedback"), icon: (0, react_jsx_runtime.jsx)(FeedbackIcon, {}), onClick: () => window.open("https://github.com/MichengAI/dsh-archive-manager/issues", "_blank", "noreferrer"), children: t("archives.feedback") })] })] }), (0, react_jsx_runtime.jsx)("p", { className: "dsham_settingsIntro", children: t("archives.description") })]
+					children: [(0, react_jsx_runtime.jsxs)("div", { className: "dsham_settingsTitleRow", children: [(0, react_jsx_runtime.jsx)("h2", { children: t("archives.title") }), (0, react_jsx_runtime.jsxs)("div", { className: "dsham_settingsLinks", children: [trashAvailable && (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, { variant: "outline", size: "sm", "aria-label": t("trash.open"), icon: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconTrashOutlineRegular, { size: 16 }), onClick: openTrash, children: t("trash.open") }), (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, { variant: "outline", size: "sm", "aria-label": t("archives.viewProject"), icon: (0, react_jsx_runtime.jsx)(GithubMark16, {}), onClick: () => window.open("https://github.com/MichengAI/dsh-archive-manager", "_blank", "noreferrer"), children: t("archives.viewProject") }), (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, { variant: "outline", size: "sm", "aria-label": t("archives.feedback"), icon: (0, react_jsx_runtime.jsx)(FeedbackIcon, {}), onClick: () => window.open("https://github.com/MichengAI/dsh-archive-manager/issues", "_blank", "noreferrer"), children: t("archives.feedback") })] })] }), (0, react_jsx_runtime.jsx)("p", { className: "dsham_settingsIntro", children: t("archives.description") })]
 					}), react.createElement("div", tabsShell(busy || unarchivingSessionIds.size > 0, (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.SegmentedTabs, {
 						className: "dsham_archiveTabs", label: t("archives.title"), value: archiveTab === "unarchived" ? "unarchived" : "archived", onChange: (value: string) => switchTab(value === "unarchived" ? "unarchived" : "archived"),
 					items: [
@@ -1470,6 +1543,8 @@ export function startArchiveClient(require: HostRequire) {
 					const target = archivedBatchTargetForGroup(group.key);
 					const groupSessionIds = groups.find((item) => item.key === group.key)?.sessions.map((session) => session.id) ?? [];
 					const count = isArchived ? deriveArchivedBatchIds(workspaceState.archivedSessionIds, workspaceState.items, target).length : groupSessionIds.length;
+					const renderedSessions = group.sessions.slice(0, renderedCounts[group.key] ?? ARCHIVE_RENDER_BATCH);
+					const remainingSessions = group.sessions.length - renderedSessions.length;
 					return (0, react_jsx_runtime.jsxs)("section", {
 						className: "dsham_settingsGroup",
 						children: [(0, react_jsx_runtime.jsxs)("div", {
@@ -1478,7 +1553,7 @@ export function startArchiveClient(require: HostRequire) {
 						}), (0, react_jsx_runtime.jsx)("div", {
 							className: "dsham_settingsList", id: "dsham-group-" + encodeURIComponent(group.key),
 							hidden: collapsedGroups.has(group.key) || undefined,
-							children: !collapsedGroups.has(group.key) && group.sessions.map((session) => (0, react_jsx_runtime.jsxs)("div", {
+							children: !collapsedGroups.has(group.key) && [...renderedSessions.map((session) => (0, react_jsx_runtime.jsxs)("div", {
                   className: "dsham_settingsRow",
                   "data-selected": selectedSessionIdSet.has(session.id),
                   children: [
@@ -1493,7 +1568,7 @@ export function startArchiveClient(require: HostRequire) {
                       isArchived && (0, react_jsx_runtime.jsx)(ArchivedSessionMenu, { busy: busy || unarchivingSessionIds.has(session.id), t, title: displayTitle(session, t), onCopyId: () => copyId(session), onPreview: typeof previewArchivedSession === "function" ? () => preview.open(session, query) : undefined, onRestoreOpen: () => viewConversation(session, true), onDelete: () => requestDelete({ kind: "session", session }) })
                     ] })
                   ]
-                }, session.id))
+                }, session.id)), remainingSessions > 0 && (0, react_jsx_runtime.jsx)("div", { className: "dsham_settingsMore", children: (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, { variant: "outline", size: "sm", disabled: busy, onClick: () => setRenderedCounts((previous) => ({ ...previous, [group.key]: (previous[group.key] ?? ARCHIVE_RENDER_BATCH) + ARCHIVE_RENDER_BATCH })), children: t("archives.showMore", { n: remainingSessions }) }) }, "__more")]
 						})]
 					}, group.key);
 				}), react.createElement(SettingsModal, {
@@ -1553,6 +1628,58 @@ export function startArchiveClient(require: HostRequire) {
 					children: (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
 						busy && (0, react_jsx_runtime.jsxs)("div", { role: "status", children: [deleteTarget?.kind === "batch" ? t("archives.deleteBatchPending") : t("deleteSession.pending"), batchProgress && (0, react_jsx_runtime.jsx)("progress", { value: batchProgress.done, max: Math.max(1, batchProgress.total), "aria-label": t("organizer.progress") }), batchProgress && t("organizer.progressCount", { done: batchProgress.done, total: batchProgress.total })] }),
 						error !== null && (0, react_jsx_runtime.jsx)("div", { className: "dsham_settingsError", role: "alert", children: error })
+					] })
+				}), (0, react_jsx_runtime.jsx)(SettingsModal, {
+					t,
+					width: 760,
+					open: trashOpen,
+					onClose: closeTrash,
+					title: t("trash.title"),
+					description: t("trash.description", { days: trashList?.retentionDays ?? 30 }),
+					footer: (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+						modalFooterButton({ disabled: trashBusy, onClick: closeTrash, children: t("trash.close") }),
+						modalFooterButton({ danger: true, disabled: trashBusy || (trashList?.items.length ?? 0) === 0, onClick: () => requestTrashPurge(null), children: t("trash.emptyTrash") })
+					] }),
+					children: (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+						trashList !== null && trashList.items.length > 0 && (0, react_jsx_runtime.jsxs)("div", { className: "dsham_trashToolbar", children: [
+							(0, react_jsx_runtime.jsxs)("label", { className: "dsham_settingsSelectionToggle", children: [
+								react.createElement(SelectionCheckbox, { checked: trashList.items.every((item) => trashSelectionSet.has(item.sessionId)), disabled: trashBusy, label: t("trash.selectAll"), onChange: (event) => toggleAllTrash(event.target.checked) }),
+								t("trash.selected", { n: trashSelected.length })
+							] }),
+							(0, react_jsx_runtime.jsxs)("div", { className: "dsham_settingsSelectionActions", children: [
+								settingsButton({ disabled: trashBusy || trashSelected.length === 0, onClick: restoreSelectedTrash, children: t("trash.restoreSelected") }),
+								settingsButton({ className: "dsham_btnDanger", disabled: trashBusy || trashSelected.length === 0, onClick: () => requestTrashPurge(trashSelected), children: t("trash.purgeSelected") })
+							] })
+						] }),
+						trashLoading && trashList === null && (0, react_jsx_runtime.jsx)("div", { className: "dsham_settingsStatus", role: "status", children: t("trash.loading") }),
+						trashError !== null && (0, react_jsx_runtime.jsx)("div", { className: "dsham_settingsError", role: "alert", children: trashError }),
+						trashNotice !== null && (0, react_jsx_runtime.jsx)("div", { className: "dsham_settingsStatus", role: "status", children: trashNotice }),
+						trashBusy && (0, react_jsx_runtime.jsx)("div", { className: "dsham_settingsStatus", role: "status", children: t("trash.busy") }),
+						trashList !== null && trashList.items.length === 0 && !trashLoading && (0, react_jsx_runtime.jsxs)("div", { className: "dsham_trashEmpty", children: [t("trash.empty"), (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, { variant: "outline", size: "sm", onClick: () => void loadTrash(), children: t("trash.retry") })] }),
+						trashList !== null && trashList.items.length > 0 && (0, react_jsx_runtime.jsx)("div", { className: "dsham_trashList", children: trashList.items.map((entry) => (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsham_trashRow",
+							"data-expired": entry.expired === true || entry.expiresAt <= Date.now() || undefined,
+							children: [
+								react.createElement(SelectionCheckbox, { checked: trashSelectionSet.has(entry.sessionId), disabled: trashBusy, label: t("trash.select", { name: trashTitle(entry, t) }), onChange: (event) => toggleTrashSelection(entry.sessionId, event.target.checked) }),
+								(0, react_jsx_runtime.jsxs)("div", { className: "dsham_trashContent", children: [
+									(0, react_jsx_runtime.jsx)("div", { className: "dsham_trashTitle", title: trashTitle(entry, t), children: trashTitle(entry, t) }),
+									(0, react_jsx_runtime.jsx)("div", { className: "dsham_trashMeta", children: `${t("trash.deletedAt", { date: archiveTimeLabel(entry.deletedAt, t) })} · ${formatByteSize(entry.sizeBytes)}` })
+								] }),
+								(0, react_jsx_runtime.jsx)("span", { className: "dsham_trashBadge", children: trashExpiryLabel(entry, t) })
+							]
+						}, entry.sessionId)) })
+					] })
+				}), (0, react_jsx_runtime.jsx)(SettingsModal, {
+					t,
+					width: 520,
+					open: trashConfirm !== null,
+					onClose: () => { if (!trashBusy) setTrashConfirm(null); },
+					title: trashConfirm?.sessionIds === null ? t("trash.purgeAllTitle") : t("trash.purgeTitle"),
+					...trashConfirm === null ? {} : { description: trashConfirm.sessionIds === null ? t("trash.purgeAllDesc", { n: trashConfirm.count }) : t("trash.purgeDesc", { n: trashConfirm.count }) },
+					footer: (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [modalFooterButton({ disabled: trashBusy, onClick: () => { if (!trashBusy) setTrashConfirm(null); }, children: t("cancel") }), modalFooterButton({ danger: true, disabled: trashBusy, onClick: purgeTrash, children: trashConfirm?.sessionIds === null ? t("trash.purgeAllConfirm") : t("trash.purgeConfirm") })] }),
+					children: (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+						trashBusy && (0, react_jsx_runtime.jsx)("div", { className: "dsham_settingsStatus", role: "status", children: t("trash.busy") }),
+						trashError !== null && (0, react_jsx_runtime.jsx)("div", { className: "dsham_settingsError", role: "alert", children: trashError })
 					] })
 				})] })]
 			});
@@ -2083,6 +2210,23 @@ export function startArchiveClient(require: HostRequire) {
 			const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 			return t("archives.timestamp", { date: t("date.ymd", { y: date.getFullYear(), m: date.getMonth() + 1, d: date.getDate() }), time });
 		}
+		function formatByteSize(bytes: number) {
+			if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+			const units = ["B", "KiB", "MiB", "GiB"];
+			let value = bytes;
+			let unit = 0;
+			while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+			return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+		}
+		function trashExpiryLabel(entry: TrashEntry, t: Translate) {
+			if (entry.expired === true || entry.expiresAt <= Date.now()) return t("trash.expired");
+			const days = Math.ceil((entry.expiresAt - Date.now()) / 86_400_000);
+			return days <= 1 ? t("trash.expiresSoon") : t("trash.expiresIn", { n: days });
+		}
+		function trashTitle(entry: TrashEntry, t: Translate) {
+			const title = entry.title?.trim();
+			return title !== undefined && title !== "" ? title : t("trash.untitled");
+		}
 		//#region dsh-archive-manager: settings section
 		const ARCHIVE_TABS_CSS = [
 			".dsham_archiveTabsLocked{opacity:.5}",
@@ -2244,6 +2388,7 @@ export function startArchiveClient(require: HostRequire) {
 		const ARCHIVE_SETTINGS_BATCH_CSS = ".dsham_settingsTitleLink{display:block;max-width:100%;padding:0;border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;font-weight:600;line-height:16px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.dsham_settingsTitleLink:hover:not(:disabled){text-decoration:underline;text-underline-offset:3px}.dsham_settingsTitleLink:disabled{cursor:default;opacity:.6}.dsham_groupToggle{display:flex;align-items:center;gap:8px;min-width:0;max-width:100%;padding:4px 0;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}.dsham_groupToggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dsham_settingsRow:hover{background:var(--dsw-alias-interactive-bg-hover)}.dsham_settingsRow[data-selected=true]{background:var(--dsw-alias-interactive-bg-hover)}.dsham_settingsTitleLink:focus-visible,.dsham_groupToggle:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#3b82f6);outline-offset:2px}@container(max-width:400px){.dsham_settingsRow{gap:6px;padding:4px 6px}.dsham_settingsActions{gap:0}.dsham_settingsMeta{font-size:10px}}.dsham_settingsGroupMeta{display:flex;align-items:center;gap:8px;flex:none;flex-wrap:wrap}.dsham_settingsStatus{margin-top:10px;color:var(--dsw-alias-label-secondary);font-size:12px}.dsham_checkbox{flex:none;box-sizing:border-box;width:16px;height:16px;margin:0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}.dsham_checkbox:focus-visible{outline:var(--dsw-focus-ring-width,1px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}.dsham_checkbox:disabled{opacity:.5;cursor:default}button.dsham_favoriteOn{color:#e8b931}button.dsham_favoriteOn:not(:disabled):hover{color:#e8b931!important;border-color:#e8b931!important}";
 		const ARCHIVE_SETTINGS_EXTERNAL_LINK_CSS = ".dsham_settingsTitleRow{display:flex;align-items:center;gap:8px 12px;min-width:0;flex-wrap:wrap}.dsham_settingsLinks{display:flex;align-items:center;gap:8px;flex-wrap:wrap}@media(max-width:720px){.dsham_settingsTitleRow{flex-wrap:wrap}}";
 		const ARCHIVE_SETTINGS_SELECTION_CSS = ".dsham_settingsSelection{margin:-8px 0 16px;padding:4px 0 12px;border-bottom:1px solid var(--dsw-alias-border-l2)}.dsham_settingsSelectionMain{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;min-height:36px}.dsham_settingsSelectionSummary{display:flex;flex-wrap:wrap;align-items:center;gap:12px;min-width:0;max-width:100%}.dsham_settingsSelectionToggle{display:inline-flex;flex:none;white-space:nowrap;align-items:center;gap:12px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;cursor:pointer}.dsham_settingsSelectionActions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;max-width:100%;margin-left:auto}.dsham_settingsSelectionScope{margin:8px 0 0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:20px;overflow-wrap:anywhere}";
+		const ARCHIVE_SETTINGS_TRASH_CSS = ".dsham_settingsMore{display:flex;justify-content:center;padding:10px}.dsham_trashIntro{margin:0 0 12px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:20px}.dsham_trashToolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;min-height:36px;margin:0 0 12px;padding-bottom:12px;border-bottom:1px solid var(--dsw-alias-border-l2)}.dsham_trashToolbar .dsham_settingsSelectionActions{margin-left:auto}.dsham_trashList{display:grid;gap:6px;max-height:min(52vh,520px);overflow:auto;padding-right:2px}.dsham_trashRow{display:flex;align-items:flex-start;gap:10px;min-width:0;padding:10px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1)}.dsham_trashRow[data-expired=true]{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary,#ef7272) 42%,transparent)}.dsham_trashContent{display:grid;gap:4px;min-width:0;flex:1}.dsham_trashTitle{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:600;line-height:20px}.dsham_trashMeta{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow-wrap:anywhere}.dsham_trashBadge{flex:none;padding:2px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:18px;white-space:nowrap}.dsham_trashRow[data-expired=true] .dsham_trashBadge{color:var(--dsw-alias-state-error-primary,#ef7272)}.dsham_trashEmpty{padding:28px 12px;text-align:center;color:var(--dsw-alias-label-tertiary);font-size:13px}.dsham_trashEmpty button{margin-top:12px}";
 		/** 设置页筛选使用宿主官方原语 Menu 规范封装，彻底摆脱 Ant Design 下拉的虚拟列表和样式限制。 */
 		function ArchiveProjectSelect({ id, className, value, options, onChange, disabled = false, "aria-label": ariaLabel, title, tabIndex, "aria-hidden": ariaHidden }: { id?: string; className?: string; value: string; options: {value: string; label: string; title?: string}[]; onChange(value: string): void; disabled?: boolean; "aria-label": string; title?: string; tabIndex?: number; "aria-hidden"?: boolean }) {
 			const [open, setOpen] = react.useState(false);
@@ -2766,26 +2911,56 @@ export function startArchiveClient(require: HostRequire) {
 			"archives.timestamp": "{date}，{time}",
 			"archives.restoreProject": "恢复项目全部聊天",
 			"archives.restoreUngrouped": "全部恢复",
-			"archives.deleteProject": "删除项目全部聊天",
+			"archives.deleteProject": "将项目聊天移入回收站",
 			"archives.deleteUngrouped": "全部删除",
 			"archives.projectActions": "项目“{name}”的归档操作",
 			"archives.ungroupedActions": "未分组聊天的归档操作",
 			"archives.restoreSuccess": "已恢复 {n} 个已归档聊天。",
 			"archives.restoreBatchFailed": "批量恢复失败：{detail}",
-			"archives.deleteSelectedTitle": "删除所选已归档聊天",
-			"archives.deleteSelectedDesc": "将永久删除所选的 {n} 个已归档聊天及其子代理（含正在运行的）和记录。其他聊天不会受影响，此操作不可恢复。",
-			"archives.deleteSelectedConfirm": "删除所选聊天",
-			"archives.deleteProjectTitle": "删除“{name}”中的已归档聊天",
-			"archives.deleteProjectDesc": "将永久删除“{name}”中的 {n} 个已归档聊天及其子代理和记录。项目目录和未归档聊天不会受影响，此操作不可恢复。",
-			"archives.deleteProjectConfirm": "删除项目全部聊天",
-			"archives.deleteUngroupedTitle": "删除未分组的已归档聊天",
-			"archives.deleteUngroupedDesc": "将永久删除未分组中的 {n} 个已归档聊天及其子代理和记录。其他项目和未归档聊天不会受影响，此操作不可恢复。",
-			"archives.deleteUngroupedConfirm": "删除未分组的全部聊天",
-			"archives.deleteBatchPending": "正在删除已归档聊天…",
-			"archives.deleteSuccess": "已删除 {n} 个已归档聊天。",
-			"archives.deleteSuccessWithSkipped": "已删除 {deleted} 个已归档聊天；另清理 {skipped} 个已不存在会话的归档记录。",
+			"archives.deleteSelectedTitle": "将所选已归档聊天移入回收站",
+			"archives.deleteSelectedDesc": "将把所选的 {n} 个已归档聊天及其子代理移入回收站，可在 30 天内恢复。其他聊天不会受影响。",
+			"archives.deleteSelectedConfirm": "移入回收站",
+			"archives.deleteProjectTitle": "将“{name}”中的已归档聊天移入回收站",
+			"archives.deleteProjectDesc": "将把“{name}”中的 {n} 个已归档聊天及其子代理移入回收站，可在 30 天内恢复。项目目录和未归档聊天不会受影响。",
+			"archives.deleteProjectConfirm": "移入回收站",
+			"archives.deleteUngroupedTitle": "将未分组的已归档聊天移入回收站",
+			"archives.deleteUngroupedDesc": "将把未分组中的 {n} 个已归档聊天及其子代理移入回收站，可在 30 天内恢复。其他项目和未归档聊天不会受影响。",
+			"archives.deleteUngroupedConfirm": "移入回收站",
+			"archives.deleteBatchPending": "正在移入回收站…",
+			"archives.deleteSuccess": "已将 {n} 个已归档聊天移入回收站。",
+			"archives.deleteSuccessWithSkipped": "已将 {deleted} 个已归档聊天移入回收站；另清理 {skipped} 个已不存在会话的归档记录。",
 			"archives.deleteSkipped": "已清理 {n} 个已不存在会话的归档记录。",
-			"archives.deletePartial": "已删除 {deleted} 个聊天，清理 {skipped} 个已不存在会话的归档记录；{failed} 个删除失败：{detail}",
+			"archives.deletePartial": "已将 {deleted} 个聊天移入回收站，清理 {skipped} 个已不存在会话的归档记录；{failed} 个移动失败：{detail}",
+			"archives.showMore": "再显示 {n} 个聊天",
+			"trash.open": "回收站",
+			"trash.title": "回收站",
+			"trash.description": "会话移入回收站后默认保留 {days} 天。过期条目会标记提醒，但仍需你确认后永久清理。",
+			"trash.empty": "回收站为空。",
+			"trash.retry": "重新加载",
+			"trash.loading": "正在加载回收站…",
+			"trash.selected": "已选择 {n} 项",
+			"trash.selectAll": "全选回收站会话",
+			"trash.select": "选择回收站会话“{name}”",
+			"trash.restoreSelected": "恢复所选",
+			"trash.purgeSelected": "永久清理所选",
+			"trash.emptyTrash": "清空回收站",
+			"trash.restoreSuccess": "已恢复 {n} 个会话。",
+			"trash.purgeSuccess": "已永久清理 {n} 个会话。",
+			"trash.partial": "已完成 {done} 项，{failed} 项失败：{detail}",
+			"trash.failed": "回收站操作失败：{detail}",
+			"trash.busy": "正在处理回收站…",
+			"trash.expired": "已超过保留期",
+			"trash.expiresSoon": "不足 1 天",
+			"trash.expiresIn": "剩余 {n} 天",
+			"trash.untitled": "未命名会话",
+			"trash.deletedAt": "删除于 {date}",
+			"trash.purgeTitle": "永久清理所选会话",
+			"trash.purgeDesc": "将永久删除所选的 {n} 个会话，此操作不可恢复。",
+			"trash.purgeAllTitle": "清空回收站？",
+			"trash.purgeAllDesc": "将永久删除回收站中的 {n} 个会话，此操作不可恢复。",
+			"trash.purgeConfirm": "永久清理",
+			"trash.purgeAllConfirm": "清空并永久删除",
+			"trash.close": "关闭",
 			"archives.unarchiveUnknown": "会话已不存在，无法取消归档。",
 			"archives.unarchiveFailed": "取消归档失败：{detail}",
 			"archives.archiveUnknown": "会话已不存在，无法归档。",
@@ -2796,12 +2971,12 @@ export function startArchiveClient(require: HostRequire) {
 			"archiveActive.confirm": "停止并归档",
 			"archiveActive.pending": "正在停止并归档…",
 			"archives.forkFailed": "分叉会话失败：{detail}",
-			"deleteSession.title": "删除会话",
-			"deleteSession.confirmTitle": "删除会话？",
-			"deleteSession.desc": "将永久删除会话“{name}”及其子代理（含正在运行的）和全部记录（对话内容、统计、缓存），此操作不可恢复。",
-			"deleteSession.pending": "正在删除会话…",
+			"deleteSession.title": "移入回收站",
+			"deleteSession.confirmTitle": "移入回收站？",
+			"deleteSession.desc": "将把会话“{name}”及其子代理移入回收站，可在 30 天内恢复；之后可永久清理。",
+			"deleteSession.pending": "正在移入回收站…",
 			"deleteSession.unknown": "会话已不存在或已被删除。",
-			"deleteSession.failed": "删除会话失败：{detail}",
+			"deleteSession.failed": "移入回收站失败：{detail}",
 			"picker.loading": "正在加载工作区…",
 			"conflict.named": "已存在名为“{name}”的工作区。",
 			"folderError.title": "无法打开文件夹",
@@ -2948,26 +3123,56 @@ export function startArchiveClient(require: HostRequire) {
 			"archives.timestamp": "{date}, {time}",
 			"archives.restoreProject": "Restore all chats in this project",
 			"archives.restoreUngrouped": "Restore all",
-			"archives.deleteProject": "Delete all chats in this project",
+			"archives.deleteProject": "Move project chats to trash",
 			"archives.deleteUngrouped": "Delete all",
 			"archives.projectActions": "Archive actions for project {name}",
 			"archives.ungroupedActions": "Archive actions for ungrouped chats",
 			"archives.restoreSuccess": "Restored {n} archived chats.",
 			"archives.restoreBatchFailed": "Could not restore the archived chats: {detail}",
-			"archives.deleteSelectedTitle": "Delete selected archived chats",
-			"archives.deleteSelectedDesc": "This permanently deletes the selected {n} archived chats, their child agents (including any that are still running), and their records. Other chats are not affected. This cannot be undone.",
-			"archives.deleteSelectedConfirm": "Delete selected chats",
-			"archives.deleteProjectTitle": "Delete archived chats in {name}",
-			"archives.deleteProjectDesc": "This permanently deletes the {n} archived chats in {name}, their child agents, and their records. The project directory and unarchived chats are not affected. This cannot be undone.",
-			"archives.deleteProjectConfirm": "Delete all project chats",
-			"archives.deleteUngroupedTitle": "Delete ungrouped archived chats",
-			"archives.deleteUngroupedDesc": "This permanently deletes the {n} ungrouped archived chats, their child agents, and their records. Other projects and unarchived chats are not affected. This cannot be undone.",
-			"archives.deleteUngroupedConfirm": "Delete all ungrouped chats",
-			"archives.deleteBatchPending": "Deleting archived chats…",
-			"archives.deleteSuccess": "Deleted {n} archived chats.",
-			"archives.deleteSuccessWithSkipped": "Deleted {deleted} archived chats and cleared {skipped} stale archive entries for sessions that no longer exist.",
+			"archives.deleteSelectedTitle": "Move selected archived chats to trash",
+			"archives.deleteSelectedDesc": "The selected {n} archived chats and their child agents will be moved to Trash and can be restored for 30 days. Other chats are not affected.",
+			"archives.deleteSelectedConfirm": "Move to trash",
+			"archives.deleteProjectTitle": "Move archived chats in {name} to trash",
+			"archives.deleteProjectDesc": "The {n} archived chats in {name} and their child agents will be moved to Trash and can be restored for 30 days. The project directory and unarchived chats are not affected.",
+			"archives.deleteProjectConfirm": "Move to trash",
+			"archives.deleteUngroupedTitle": "Move ungrouped archived chats to trash",
+			"archives.deleteUngroupedDesc": "The {n} ungrouped archived chats and their child agents will be moved to Trash and can be restored for 30 days. Other projects and unarchived chats are not affected.",
+			"archives.deleteUngroupedConfirm": "Move to trash",
+			"archives.deleteBatchPending": "Moving archived chats to trash…",
+			"archives.deleteSuccess": "Moved {n} archived chats to trash.",
+			"archives.deleteSuccessWithSkipped": "Moved {deleted} archived chats to trash and cleared {skipped} stale archive entries for sessions that no longer exist.",
 			"archives.deleteSkipped": "Cleared {n} stale archive entries for sessions that no longer exist.",
-			"archives.deletePartial": "Deleted {deleted} chats and cleared {skipped} stale archive entries; {failed} could not be deleted: {detail}",
+			"archives.deletePartial": "Moved {deleted} chats to trash and cleared {skipped} stale archive entries; {failed} could not be moved: {detail}",
+			"archives.showMore": "Show {n} more chats",
+			"trash.open": "Trash",
+			"trash.title": "Trash",
+			"trash.description": "Moved sessions are normally retained for {days} days. Expired items are highlighted but are only permanently deleted after you confirm.",
+			"trash.empty": "Trash is empty.",
+			"trash.retry": "Reload",
+			"trash.loading": "Loading Trash…",
+			"trash.selected": "{n} selected",
+			"trash.selectAll": "Select all sessions in Trash",
+			"trash.select": "Select trashed session {name}",
+			"trash.restoreSelected": "Restore selected",
+			"trash.purgeSelected": "Permanently delete selected",
+			"trash.emptyTrash": "Empty Trash",
+			"trash.restoreSuccess": "Restored {n} sessions.",
+			"trash.purgeSuccess": "Permanently deleted {n} sessions.",
+			"trash.partial": "Completed {done} items; {failed} failed: {detail}",
+			"trash.failed": "Trash operation failed: {detail}",
+			"trash.busy": "Updating Trash…",
+			"trash.expired": "Retention expired",
+			"trash.expiresSoon": "Less than 1 day",
+			"trash.expiresIn": "{n} days left",
+			"trash.untitled": "Untitled session",
+			"trash.deletedAt": "Deleted {date}",
+			"trash.purgeTitle": "Permanently delete selected sessions",
+			"trash.purgeDesc": "The selected {n} sessions will be permanently deleted. This cannot be undone.",
+			"trash.purgeAllTitle": "Empty Trash?",
+			"trash.purgeAllDesc": "All {n} sessions in Trash will be permanently deleted. This cannot be undone.",
+			"trash.purgeConfirm": "Permanently delete",
+			"trash.purgeAllConfirm": "Empty and permanently delete",
+			"trash.close": "Close",
 			"archives.unarchiveUnknown": "This session no longer exists, so it cannot be unarchived.",
 			"archives.unarchiveFailed": "Could not unarchive the session: {detail}",
 			"archives.archiveUnknown": "This session no longer exists, so it cannot be archived.",
@@ -2978,12 +3183,12 @@ export function startArchiveClient(require: HostRequire) {
 			"archiveActive.confirm": "Stop and archive",
 			"archiveActive.pending": "Stopping and archiving…",
 			"archives.forkFailed": "Could not fork the session: {detail}",
-			"deleteSession.title": "Delete session",
-			"deleteSession.confirmTitle": "Delete session?",
-			"deleteSession.desc": "This permanently deletes session “{name}”, its child agents (including any that are still running), and all of its records (conversation, stats, cache). This cannot be undone.",
-			"deleteSession.pending": "Deleting session…",
+			"deleteSession.title": "Move to trash",
+			"deleteSession.confirmTitle": "Move to trash?",
+			"deleteSession.desc": "Session “{name}” and its child agents will be moved to Trash and can be restored for 30 days. You can permanently delete it later.",
+			"deleteSession.pending": "Moving session to trash…",
 			"deleteSession.unknown": "This session no longer exists or was already deleted.",
-			"deleteSession.failed": "Could not delete the session: {detail}",
+			"deleteSession.failed": "Could not move the session to trash: {detail}",
 			"picker.loading": "Loading workspaces…",
 			"conflict.named": "A workspace named “{name}” already exists.",
 			"folderError.title": "Couldn’t open folder",
@@ -3129,26 +3334,56 @@ export function startArchiveClient(require: HostRequire) {
 			"archives.timestamp": "{date}, {time}",
 			"archives.restoreProject": "Восстановить все чаты этого проекта",
 			"archives.restoreUngrouped": "Восстановить все",
-			"archives.deleteProject": "Удалить все чаты этого проекта",
+			"archives.deleteProject": "Переместить чаты проекта в корзину",
 			"archives.deleteUngrouped": "Удалить все",
 			"archives.projectActions": "Действия архивации для проекта {name}",
 			"archives.ungroupedActions": "Действия архивации для несгруппированных чатов",
 			"archives.restoreSuccess": "Восстановлено заархивированных чатов: {n}.",
 			"archives.restoreBatchFailed": "Не удалось восстановить заархивированные чаты: {detail}",
-			"archives.deleteSelectedTitle": "Удалить выбранные заархивированные чаты",
-			"archives.deleteSelectedDesc": "Это окончательно удалит выбранные {n} заархивированных чатов, их дочерние агенты (включая ещё работающие) и их записи. Другие чаты не затрагиваются. Это действие необратимо.",
-			"archives.deleteSelectedConfirm": "Удалить выбранные чаты",
-			"archives.deleteProjectTitle": "Удалить заархивированные чаты в {name}",
-			"archives.deleteProjectDesc": "Это окончательно удалит {n} заархивированных чатов в {name}, их дочерние агенты и записи. Каталог проекта и незаархивированные чаты не затрагиваются. Это действие необратимо.",
-			"archives.deleteProjectConfirm": "Удалить все чаты проекта",
-			"archives.deleteUngroupedTitle": "Удалить несгруппированные заархивированные чаты",
-			"archives.deleteUngroupedDesc": "Это окончательно удалит {n} несгруппированных заархивированных чатов, их дочерние агенты и записи. Другие проекты и незаархивированные чаты не затрагиваются. Это действие необратимо.",
-			"archives.deleteUngroupedConfirm": "Удалить все несгруппированные чаты",
-			"archives.deleteBatchPending": "Удаление заархивированных чатов…",
-			"archives.deleteSuccess": "Удалено заархивированных чатов: {n}.",
-			"archives.deleteSuccessWithSkipped": "Удалено {deleted} заархивированных чатов и очищено {skipped} устаревших записей архива для несуществующих сессий.",
+			"archives.deleteSelectedTitle": "Переместить выбранные заархивированные чаты в корзину",
+			"archives.deleteSelectedDesc": "Выбранные {n} заархивированных чатов и их дочерние агенты будут перемещены в корзину и доступны для восстановления в течение 30 дней. Другие чаты не затрагиваются.",
+			"archives.deleteSelectedConfirm": "Переместить в корзину",
+			"archives.deleteProjectTitle": "Переместить заархивированные чаты в {name} в корзину",
+			"archives.deleteProjectDesc": "{n} заархивированных чатов в {name} и их дочерние агенты будут перемещены в корзину и доступны для восстановления в течение 30 дней. Каталог проекта и незаархивированные чаты не затрагиваются.",
+			"archives.deleteProjectConfirm": "Переместить в корзину",
+			"archives.deleteUngroupedTitle": "Переместить несгруппированные заархивированные чаты в корзину",
+			"archives.deleteUngroupedDesc": "{n} несгруппированных заархивированных чатов и их дочерние агенты будут перемещены в корзину и доступны для восстановления в течение 30 дней. Другие проекты и незаархивированные чаты не затрагиваются.",
+			"archives.deleteUngroupedConfirm": "Переместить в корзину",
+			"archives.deleteBatchPending": "Перемещение заархивированных чатов в корзину…",
+			"archives.deleteSuccess": "В корзину перемещено заархивированных чатов: {n}.",
+			"archives.deleteSuccessWithSkipped": "В корзину перемещено {deleted} заархивированных чатов и очищено {skipped} устаревших записей архива для несуществующих сессий.",
 			"archives.deleteSkipped": "Очищено {n} устаревших записей архива для несуществующих сессий.",
-			"archives.deletePartial": "Удалено {deleted} чатов и очищено {skipped} устаревших записей архива; {failed} не удалось удалить: {detail}",
+			"archives.deletePartial": "В корзину перемещено {deleted} чатов и очищено {skipped} устаревших записей архива; {failed} не удалось переместить: {detail}",
+			"archives.showMore": "Показать ещё {n} чатов",
+			"trash.open": "Корзина",
+			"trash.title": "Корзина",
+			"trash.description": "Перемещённые сессии обычно хранятся {days} дней. Просроченные элементы выделяются, но окончательно удаляются только после подтверждения.",
+			"trash.empty": "Корзина пуста.",
+			"trash.retry": "Обновить",
+			"trash.loading": "Загрузка корзины…",
+			"trash.selected": "Выбрано: {n}",
+			"trash.selectAll": "Выбрать все сессии в корзине",
+			"trash.select": "Выбрать сессию в корзине {name}",
+			"trash.restoreSelected": "Восстановить выбранные",
+			"trash.purgeSelected": "Удалить выбранные навсегда",
+			"trash.emptyTrash": "Очистить корзину",
+			"trash.restoreSuccess": "Восстановлено сессий: {n}.",
+			"trash.purgeSuccess": "Навсегда удалено сессий: {n}.",
+			"trash.partial": "Выполнено: {done}; ошибок: {failed}: {detail}",
+			"trash.failed": "Ошибка операции с корзиной: {detail}",
+			"trash.busy": "Обновление корзины…",
+			"trash.expired": "Срок хранения истёк",
+			"trash.expiresSoon": "Менее 1 дня",
+			"trash.expiresIn": "Осталось дней: {n}",
+			"trash.untitled": "Сессия без названия",
+			"trash.deletedAt": "Удалено {date}",
+			"trash.purgeTitle": "Удалить выбранные сессии навсегда",
+			"trash.purgeDesc": "Выбранные сессии ({n}) будут удалены навсегда. Это действие необратимо.",
+			"trash.purgeAllTitle": "Очистить корзину?",
+			"trash.purgeAllDesc": "Все сессии в корзине ({n}) будут удалены навсегда. Это действие необратимо.",
+			"trash.purgeConfirm": "Удалить навсегда",
+			"trash.purgeAllConfirm": "Очистить и удалить навсегда",
+			"trash.close": "Закрыть",
 			"archives.unarchiveUnknown": "Эта сессия больше не существует, поэтому её нельзя вернуть из архива.",
 			"archives.unarchiveFailed": "Не удалось вернуть сессию из архива: {detail}",
 			"archives.archiveUnknown": "Эта сессия больше не существует, поэтому её нельзя заархивировать.",
@@ -3159,12 +3394,12 @@ export function startArchiveClient(require: HostRequire) {
 			"archiveActive.confirm": "Остановить и заархивировать",
 			"archiveActive.pending": "Остановка и архивация…",
 			"archives.forkFailed": "Не удалось создать ветку сессии: {detail}",
-			"deleteSession.title": "Удалить сессию",
-			"deleteSession.confirmTitle": "Удалить сессию?",
-			"deleteSession.desc": "Это окончательно удалит сессию «{name}», её дочерние агенты (включая ещё работающие) и все её записи (разговор, статистику, кэш). Это действие необратимо.",
-			"deleteSession.pending": "Удаление сессии…",
+			"deleteSession.title": "Переместить в корзину",
+			"deleteSession.confirmTitle": "Переместить в корзину?",
+			"deleteSession.desc": "Сессия «{name}» и её дочерние агенты будут перемещены в корзину и доступны для восстановления в течение 30 дней. Позже их можно удалить навсегда.",
+			"deleteSession.pending": "Перемещение сессии в корзину…",
 			"deleteSession.unknown": "Эта сессия больше не существует или уже удалена.",
-			"deleteSession.failed": "Не удалось удалить сессию: {detail}",
+			"deleteSession.failed": "Не удалось переместить сессию в корзину: {detail}",
 			"picker.loading": "Загрузка рабочих пространств…",
 			"conflict.named": "Рабочее пространство с именем «{name}» уже существует.",
 			"folderError.title": "Не удалось открыть папку",
@@ -3388,6 +3623,11 @@ export function startArchiveClient(require: HostRequire) {
             const searchArchivedContent: RegistryCalls["searchArchivedContent"] = input => registryCall("searchArchivedContent", input);
             const searchSessionContent: RegistryCalls["searchSessionContent"] = input => registryCall("searchSessionContent", input);
             const previewArchivedSession: RegistryCalls["previewArchivedSession"] = input => registryCall("previewArchivedSession", input);
+            const trashSession: RegistryCalls["trashSession"] = sessionId => registryCall("trashSession", sessionId);
+            const trashArchivedSessions: RegistryCalls["trashArchivedSessions"] = target => registryCall("trashArchivedSessions", target);
+            const trashedSessions: RegistryCalls["trashedSessions"] = () => registryCall("trashedSessions");
+            const restoreTrashedSessions: RegistryCalls["restoreTrashedSessions"] = input => registryCall("restoreTrashedSessions", input);
+            const purgeTrashedSessions: RegistryCalls["purgeTrashedSessions"] = input => registryCall("purgeTrashedSessions", input);
             const favoriteSessions = () => registryCall("favoriteSessions");
             const setSessionFavorite: RegistryCalls["setSessionFavorite"] = input => registryCall("setSessionFavorite", input);
             /** 主界面星标与归档面板共用的收藏存储；读写仍然回到上面两个注册表方法。 */
@@ -3399,12 +3639,7 @@ export function startArchiveClient(require: HostRequire) {
             const organizeBatch = createSessionOrganizer({
 				workspaces: ctx.workspaces.list, sessions: ctx.sessions.list,
 				archive: (id) => ctx.workspaces.archiveSession(id), restore: async (id) => { await unarchiveOne(id); return undefined; },
-				deleteOne: async (id) => {
-					const registry = ctx.get("remote.workspaceRegistry");
-					if (!registry) throw new Error(ctx.locale.bind(NS)("service.unavailable"));
-					const result = await registry.deleteSession(id);
-					if (!result.ok) throw new Error(result.error.message);
-				},
+				deleteOne: async (id) => { await trashSession(id); },
 				getFavorites: favoriteSessions, refresh: () => ctx.sessions.refresh?.(), currentSessionId
 			});
 			const unarchiveSession = async (sessionId: string) => {
@@ -3412,10 +3647,7 @@ export function startArchiveClient(require: HostRequire) {
 				await refreshSessionList();
 			};
 			const deleteSession = async (sessionId: string) => {
-				const registry = ctx.get("remote.workspaceRegistry");
-				if (registry === void 0) throw new Error("archive-manager remote service is unavailable");
-				const result = await registry.deleteSession(sessionId);
-				if (!result.ok) throw new Error(result.error.message);
+				await trashSession(sessionId);
 				await refreshSessionList();
 			};
 			const moveSession = async (sessionId: string, targetWorkspaceId: string) => {
@@ -3433,12 +3665,20 @@ export function startArchiveClient(require: HostRequire) {
 				return unarchiveSessionsViaOfficial(ctx.workspaces, sessionIds, refreshSessionList, unarchiveOne);
 			};
 			const deleteArchivedSessions = async (target: BatchTarget) => {
-				const registry = ctx.get("remote.workspaceRegistry");
-				if (registry === void 0) throw new Error("archive-manager remote service is unavailable");
-				const result = await registry.deleteArchivedSessions(target);
-				if (!result.ok) throw new Error(result.error.message);
+				const result = await trashArchivedSessions(target);
 				const refreshError = await refreshSessionList();
-				return { ...result.value, refreshError };
+				return { requestedSessionIds: result.requestedSessionIds, deletedSessionIds: result.trashedSessionIds, skippedSessionIds: result.skippedSessionIds, failures: result.failures, refreshError };
+			};
+			const restoreTrashedSessionsAndRefresh = async (input: { sessionIds: string[] }) => {
+				const result = await restoreTrashedSessions(input);
+				await refreshSessionList();
+				try {
+					const favorites = await favoriteSessions();
+					favoriteRowStore.adopt(favorites.favoriteSessionIds);
+				} catch (error) {
+					console.warn("archive-manager: restored sessions but favorite refresh failed:", error);
+				}
+				return result;
 			};
 			const archivedSessionMetadata = async () => {
 				const registry = ctx.get("remote.workspaceRegistry");
@@ -4551,6 +4791,11 @@ export function startArchiveClient(require: HostRequire) {
 				deleteSession,
 				unarchiveSessions,
 				deleteArchivedSessions,
+				trashSession,
+				trashArchivedSessions,
+				trashedSessions,
+				restoreTrashedSessions: restoreTrashedSessionsAndRefresh,
+				purgeTrashedSessions,
 				archivedSessionMetadata, openConversation, focusSessionWorkspace, viewState: archiveViewState,
 				favoriteSessions, setSessionFavorite, favoriteSync: favoriteRowStore, organizeBatch, diagnoseOrphanSubagents, cleanOrphanSubagents, diagnoseSessionCaches, rebuildSessionCaches, refreshCacheLists, searchSessionContent, searchArchivedContent, previewArchivedSession,
 				t: ctx.locale.bind(NS)
@@ -4625,7 +4870,8 @@ export function startArchiveClient(require: HostRequire) {
 			unarchivedSessionIds,
 			ArchiveSelectionToolbar,
 			ArchivedSessionsSection,
-			zh, en,
+			zh, en, ru,
+			ARCHIVE_RENDER_BATCH,
 			displayTitle,
 			sessionVisible,
 			indexSubagentDescendants,

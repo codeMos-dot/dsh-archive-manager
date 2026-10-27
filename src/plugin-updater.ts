@@ -4,6 +4,7 @@ import { symbols } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/dsh-host-webserver";
 import { record } from "./contracts.js";
 import { guardReleaseAgeExclude, mergeMinimumReleaseAgeExclude, recordReleaseAgeExclude } from "./release-age.js";
+import { RegistrySecurityClient } from "./registry-security.js";
 interface DesktopPnpm { runPlugin(args: string[], directory: string): { done: Promise<{ exitCode: number }> } }
 interface PackageManagerLaunch { command: string; args: readonly string[]; env?: NodeJS.ProcessEnv }
 interface PluginManagerInstall { installBundle(spec: string): Promise<{ application?: string; error?: { message?: string }; packageResult?: { output?: string } }> }
@@ -14,6 +15,8 @@ interface UpdateOptions {
   packageName: string;
   manifestUrl: URL;
   isEnabled?: () => Promise<boolean> | boolean;
+  securityClient?: RegistrySecurityClient;
+  installer?: (target: UpdateRuntime, packageSpec: string) => Promise<void>;
 }
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -219,19 +222,12 @@ function comparePrerelease(left: readonly string[], right: readonly string[]) {
   }
   return 0;
 }
-let latestCache: { packageName: string; version: string; expiresAt: number } | undefined;
-async function latestVersion(packageName: string) {
-  if (latestCache?.packageName === packageName && Date.now() < latestCache.expiresAt) return latestCache.version;
-  try {
-    const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(packageName)}/latest`, { signal: AbortSignal.timeout(8e3) });
-    if (!response.ok) return void 0;
-    const value = record(await response.json());
-    if (typeof value.version !== "string" || value.version === "") return void 0;
-    latestCache = { packageName, version: value.version, expiresAt: Date.now() + 5 * 6e4 };
-    return value.version;
-  } catch {
-    return void 0;
-  }
+const defaultSecurityClient = new RegistrySecurityClient();
+function securityClient(options: UpdateOptions) {
+  return options.securityClient ?? defaultSecurityClient;
+}
+async function latestVersion(options: UpdateOptions) {
+  return securityClient(options).latest(options.packageName);
 }
 async function currentVersion(manifestUrl: URL) {
   const value = record(JSON.parse(await readFile(manifestUrl, "utf8")));
@@ -240,13 +236,22 @@ async function currentVersion(manifestUrl: URL) {
 }
 async function status(options: UpdateOptions, target: UpdateRuntime) {
   const current = await currentVersion(options.manifestUrl);
-  const latest = await latestVersion(options.packageName);
+  const latest = await latestVersion(options);
+  const latestVersionValue = latest?.version;
   return {
     packageName: options.packageName,
     currentVersion: current,
-    ...latest === void 0 ? {} : { latestVersion: latest },
-    latestCheckFailed: latest === void 0,
-    updateAvailable: latest !== void 0 && isNewerVersion(current, latest),
+    ...latestVersionValue === void 0 ? {} : { latestVersion: latestVersionValue },
+    latestCheckFailed: latestVersionValue === void 0,
+    updateAvailable: latest?.verified === true && isNewerVersion(current, latest.version),
+    securityVerified: latest?.verified === true,
+    provenanceVerified: latest?.verified === true,
+    ...latest?.verified === true ? {
+      signerKeyId: latest.signerKeyId,
+      sourceRepository: latest.provenance.repository,
+      ...latest.provenance.sourceCommit === void 0 ? {} : { sourceCommit: latest.provenance.sourceCommit },
+    } : latest?.signerKeyId === void 0 ? {} : { signerKeyId: latest.signerKeyId },
+    ...latest?.verified === false ? { securityError: latest.message, securityCode: latest.code } : {},
     profileName: target.profileName,
     canAutoUpdate: target.canAutoUpdate
   };
@@ -417,19 +422,82 @@ function registerPluginUpdater(ctx: Context, options: UpdateOptions) {
           json(response, 503, { error: "\u6682\u65F6\u65E0\u6CD5\u83B7\u53D6\u6700\u65B0\u7248\u672C\u3002" });
           return;
         }
+        if (before.securityVerified !== true) {
+          json(response, 503, {
+            ...before,
+            ok: false,
+            error: `\u66F4\u65B0\u5B89\u5168\u6821\u9A8C\u672A\u901A\u8FC7\uFF1A${before.securityError ?? "\u7B7E\u540D\u6216 provenance \u65E0\u6548"}`,
+          });
+          return;
+        }
         if (!before.updateAvailable) {
           json(response, 200, before);
           return;
         }
+        const latest = before.latestVersion;
+        const verification = await securityClient(options).verifyVersion(options.packageName, latest, { freshKeys: true });
+        if (!verification.verified) {
+          json(response, 503, {
+            ...before,
+            ok: false,
+            securityVerified: false,
+            provenanceVerified: false,
+            securityError: verification.message,
+            securityCode: verification.code,
+            ...verification.signerKeyId === void 0 ? {} : { signerKeyId: verification.signerKeyId },
+            error: `\u66F4\u65B0\u5B89\u5168\u6821\u9A8C\u672A\u901A\u8FC7\uFF1A${verification.message}`,
+          });
+          return;
+        }
+        if (verification.packageName !== options.packageName || verification.version !== latest) {
+          const message = "\u5B89\u88C5\u524D\u5B89\u5168\u6821\u9A8C\u8FD4\u56DE\u7684\u5305\u540D\u6216\u7248\u672C\u4E0E\u5F85\u5B89\u88C5\u76EE\u6807\u4E0D\u4E00\u81F4";
+          json(response, 503, {
+            ...before,
+            ok: false,
+            securityVerified: false,
+            provenanceVerified: false,
+            securityCode: "invalid-metadata",
+            securityError: message,
+            error: `\u66F4\u65B0\u5B89\u5168\u6821\u9A8C\u672A\u901A\u8FC7\uFF1A${message}`,
+          });
+          return;
+        }
+        const runInstall = options.installer ?? install;
         installing = true;
         try {
-          await install(target, `${options.packageName}@${before.latestVersion}`);
+          try {
+            await runInstall(target, `${options.packageName}@${latest}`);
+          } catch (error) {
+            let rolledBack = false;
+            let rollbackError: string | undefined;
+            try {
+              await runInstall(target, `${options.packageName}@${before.currentVersion}`);
+              rolledBack = true;
+            } catch (rollbackFailure) {
+              rollbackError = publicError(rollbackFailure);
+              ctx.logger.warn(`plugin updater rollback failed: ${String(rollbackFailure)}`);
+            }
+            const detail = publicError(error);
+            const message = rolledBack
+              ? `${detail}\uFF1B\u5DF2\u81EA\u52A8\u56DE\u6EDA\u5230 v${before.currentVersion}\u3002`
+              : `${detail}\uFF1B\u81EA\u52A8\u56DE\u6EDA\u4E5F\u5931\u8D25${rollbackError === void 0 ? "" : `\uFF1A${rollbackError}`}\u3002`;
+            ctx.logger.warn(`plugin updater install failed for v${latest}: ${detail}`);
+            json(response, 503, {
+              ...before,
+              ok: false,
+              error: message,
+              failedVersion: latest,
+              rolledBack,
+              ...rollbackError === void 0 ? {} : { rollbackError },
+            });
+            return;
+          }
         } finally {
           installing = false;
         }
         const notifyParent = shouldNotifyParent(target);
         const autoReload = target.desktopPnpm !== void 0 || notifyParent;
-        json(response, 200, { ...before, updatedVersion: before.latestVersion, restartRequired: true, autoReload, ...target.officialDesktop ? { restartDesktop: true } : {} });
+        json(response, 200, { ...before, updatedVersion: latest, restartRequired: true, autoReload, ...target.officialDesktop ? { restartDesktop: true } : {} });
         if (notifyParent) setTimeout(() => {
           process.send?.(PLUGIN_UPDATE_IPC);
         }, 150).unref?.();

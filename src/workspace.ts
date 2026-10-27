@@ -3,16 +3,18 @@ import { confirmColdCacheWrite } from "./cache-rebuild.js";
 import { cacheIdentity, cacheRebuildInput, cacheRebuildInvocations } from "./cache-rebuild-contract.js";
 import type { CacheDiagnosis, CacheRebuildResult } from "./cache-rebuild-contract.js";
 import { symbols } from "@deepseek-ai/cordis";
-import type { Domain, DomainGlobalSpec } from "@deepseek-ai/dsh-storage-domain";
+import type { Domain, DomainGlobalSpec, DomainSpec } from "@deepseek-ai/dsh-storage-domain";
 import type { TypertContribution } from "@deepseek-ai/dsh-typert-registry";
-import type { Header, HostContext, PersistenceCompat, SessionsCompat, WorkspaceConstructor } from "./host-compat.js";
+import type { Header, HostContext, PersistenceCompat, PersistenceSnapshotCompat, SessionsCompat, WorkspaceConstructor } from "./host-compat.js";
 import { record, errorMessage, errorCode } from "./contracts.js";
 import type { Schema } from "./contracts.js";
 import type { TypertGatewayBinding } from "@deepseek-ai/dsh-typert-protocol";
 type BatchTarget = { scope: "all" | "ungrouped" } | { scope: "workspace"; workspaceId: string } | { scope: "sessions"; sessionIds: string[] };
-import { discoveryInvocations, searchInputSchema, previewInputSchema, extractConversation, findContentMatch, previewConversation } from "./archive-discovery.js";
-import { lstat, readdir, rm } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { discoveryInvocations, searchInputSchema, previewInputSchema, extractConversation, findContentMatch, previewConversation, mapSettledConcurrent } from "./archive-discovery.js";
+import { cp, lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { randomUUID } from "node:crypto";
 import { WorkspaceRegistry } from "@deepseek-ai/dsh-workspace";
 import { bindTypertRemote, Remote } from "@deepseek-ai/dsh-typert-protocol";
 import { sessionDir } from "@deepseek-ai/dsh-spill-local";
@@ -20,12 +22,39 @@ import { defineDomain } from "@deepseek-ai/dsh-storage-domain";
 import { favoriteInputSchema, favoriteStateSchema, favoriteInvocations } from "./archive-organizer.js";
 import { moveSessionToWorkspace } from "./session-move.js";
 import type { SessionMoveResult, SessionMoveContext } from "./session-move.js";
+import { MAX_TRASH_ENTRIES, searchIndexDomainSpec, trashDomainSpec, trashEntrySchema, trashInvocations, purgeTrashSchema, trashIdsSchema } from "./archive-store.js";
+import type { TrashBatch, TrashEntry, TrashList, TrashPurgeResult, TrashRestoreResult } from "./archive-store.js";
+import { createSearchIndexRecord, searchIndexFingerprint, usableSearchIndexRecord } from "./archive-search-index.js";
 
 const favoriteDomainSpec = defineDomain({
 	name: "archive_manager_favorites", version: 1, tables: {},
 	// 宿主运行时仅调用 parse/safeParse；兼容早期同构 schema，不新增 Zod 运行依赖。
 	global: { schema: favoriteStateSchema as unknown as DomainGlobalSpec<{ favoriteSessionIds: string[] }>["schema"], initial: { favoriteSessionIds: [] as string[] } },
 });
+/** 单次搜索最多 20 个会话；并发 4 可在磁盘吞吐与宿主负载之间取得平衡。 */
+const SEARCH_SESSION_CONCURRENCY = 4;
+const TRASH_RETENTION_DAYS = 30;
+const MAX_TRASH_BYTES = 1024 * 1024 * 1024;
+
+interface StorageDomainCompat {
+	open<S extends DomainSpec>(spec: S): Promise<Domain<S>>;
+	get?(name: string): Domain<DomainSpec> | undefined;
+}
+
+async function openOptionalDomain<S extends DomainSpec>(ctx: Context, spec: S) {
+	const storage = (ctx as unknown as { storageDomain?: StorageDomainCompat }).storageDomain;
+	if (storage === undefined || typeof storage.open !== "function") return undefined;
+	try {
+		return await storage.open(spec);
+	} catch (error) {
+		const message = errorMessage(error);
+		if (message.includes("already-open") && typeof storage.get === "function") {
+			return storage.get(spec.name) as Domain<S> | undefined;
+		}
+		ctx.logger.warn(`archive-manager: could not open ${spec.name}: ${message}`);
+		return undefined;
+	}
+}
 //#region lib/types/index.js
 /**
  * dsh-archive-manager 宿主侧归档会话管理。
@@ -128,6 +157,47 @@ async function estimatePathSize(path: string): Promise<number> {
 	return 0;
 }
 
+const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+function archiveManagerHome() {
+	const configured = process.env.DSH_HOME;
+	return typeof configured === "string" && configured.trim() !== "" ? resolve(configured.trim()) : join(homedir(), ".dsh");
+}
+
+function archiveManagerTrashRoot() {
+	return join(archiveManagerHome(), "archive-manager", "trash");
+}
+
+function pathWithin(root: string, candidate: string) {
+	const rel = relative(resolve(root), resolve(candidate));
+	return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function trashSessionSegment(sessionId: string) {
+	const encoded = sessionId.replace(/[^A-Za-z0-9._-]/g, (character) => `~${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
+	return (encoded || "session").slice(0, 180);
+}
+
+function trashArtifactName(kind: string) {
+	return kind === "session directory" ? "session" : "artifact";
+}
+
+async function movePath(source: string, destination: string) {
+	try {
+		await rename(source, destination);
+	} catch (error) {
+		if (errorCode(error) !== "EXDEV") throw error;
+		await cp(source, destination, { recursive: true, errorOnExist: true, force: false });
+		await rm(source, { recursive: true, force: true });
+	}
+}
+
+async function assertRealDirectory(path: string) {
+	const stat = await lstat(path);
+	if (stat.isSymbolicLink()) throw new Error(`refusing to use symbolic link "${path}"`);
+	if (!stat.isDirectory()) throw new Error(`expected directory "${path}"`);
+}
+
 class PersistenceStillPresentError extends Error {
 	constructor(sessionId: string) {
 		super(`session "${sessionId}" is still present in persistence after artifact removal`);
@@ -155,6 +225,11 @@ const ARCHIVE_REMOTE_METHODS = [
 	"unarchiveSession",
 	"deleteSession",
 	"deleteArchivedSessions",
+	"trashSession",
+	"trashArchivedSessions",
+	"trashedSessions",
+	"restoreTrashedSessions",
+	"purgeTrashedSessions",
 	"archivedSessionMetadata",
 	"favoriteSessions",
 	"setSessionFavorite",
@@ -334,6 +409,7 @@ const ARCHIVE_MANAGER_INVOCATIONS = [
 	...cacheRebuildInvocations(),
 	...favoriteInvocations(),
 	...discoveryInvocations(),
+	...trashInvocations({ sessionId: sessionIdSchema, batchTarget: archivedBatchTargetSchema }),
 	{
 		id: "@michengai/dsh-archive-manager#workspaceRegistry/unarchiveSession",
 		service: "workspaceRegistry",
@@ -524,6 +600,8 @@ var ArchiveWorkspaceRegistry = class extends (WorkspaceRegistry as unknown as Re
 	];
 	declare typertRemote: TypertGatewayBinding<this>;
 	declare favoriteDomainPromise: Promise<Domain<typeof favoriteDomainSpec>> | undefined;
+	declare searchIndexDomainPromise: Promise<Domain<typeof searchIndexDomainSpec> | undefined> | undefined;
+	declare trashDomainPromise: Promise<Domain<typeof trashDomainSpec> | undefined> | undefined;
 	constructor(ctx: Context) {
 		super(ctx);
 		this.typertRemote = bindTypertRemote(this, this.name);
@@ -548,31 +626,97 @@ var ArchiveWorkspaceRegistry = class extends (WorkspaceRegistry as unknown as Re
         if (!persistence || typeof persistence.open !== "function") throw new Error("当前宿主不支持只读会话，请打开完整会话查看");
         return (await this.readStoredProjectionSource(persistence, sessionId)).events;
     }
-    /** 已归档与未归档共用正文检索；只读已知会话，不激活或改变归档状态。 */
-    async searchSessionContent(input: unknown) {
-        const { sessionIds, query } = searchInputSchema.parse(input);
-        const items = [], failures = [];
-        for (const sessionId of sessionIds) {
-            try {
-                if (!(await this.sessionKnown(sessionId))) throw new Error("会话不存在，请刷新列表");
-                const messages = extractConversation(await this.readConversationEvents(sessionId));
-                if (!(await this.sessionKnown(sessionId))) throw new Error("会话已移除，请刷新列表");
-                const match = findContentMatch(messages, query);
-                if (match) items.push({ sessionId, ...match });
-            } catch (error) { failures.push({ sessionId, message: errorMessage(error).slice(0, 500) }); }
-        }
-        return { items, failures };
-    }
-    /** 输入为限定批次的归档 ID 和关键词，逐条返回命中或失败。 */
-    async searchArchivedContent(input: unknown) {
-		const { sessionIds, query } = searchInputSchema.parse(input);
-		const items = [], failures = [];
-		for (const sessionId of sessionIds) {
-			try {
-				const match = findContentMatch(await this.readArchivedConversation(sessionId), query);
-				if (match) items.push({ sessionId, ...match });
-			} catch (error) { failures.push({ sessionId, message: errorMessage(error).slice(0, 500) }); }
+	async searchIndexTable() {
+		this.searchIndexDomainPromise ??= openOptionalDomain(this.ctx, searchIndexDomainSpec);
+		const domain = await this.searchIndexDomainPromise;
+		if (domain === undefined) return undefined;
+		try {
+			const table = domain.table("sessions");
+			return table === undefined ? undefined : table as unknown as {
+				get(key: string): unknown;
+				put(key: string, value: unknown): Promise<void>;
+			};
+		} catch (error) {
+			this.ctx.logger.warn(`archive-manager: search index table unavailable: ${errorMessage(error)}`);
+			return undefined;
 		}
+	}
+	/**
+	 * Read searchable text through a revision-keyed persistent cache. A missing
+	 * or failed cache never fails the search: the current log read is returned
+	 * and the next request simply retries indexing.
+	 */
+	async readConversationForSearch(sessionId: string, options: { archived?: boolean } = {}) {
+		const check = async () => {
+			if (options.archived === true) {
+				if (!this.requireState().archivedSessionIds.includes(sessionId)) throw new Error("会话已不在归档中，请刷新列表");
+			} else if (!(await this.sessionKnown(sessionId))) {
+				throw new Error("会话不存在，请刷新列表");
+			}
+		};
+		await check();
+		const persistence = this.ctx.get("sessionPersistence");
+		let snapshot: PersistenceSnapshotCompat | undefined;
+		if (persistence !== undefined && typeof persistence.stat === "function") {
+			try { snapshot = await persistence.stat(sessionId); }
+			catch (error) { this.ctx.logger.warn(`archive-manager: stat failed for search cache "${sessionId}": ${errorMessage(error)}`); }
+		}
+		const header = snapshot?.header ?? this.headers.get(sessionId);
+		const fingerprint = header === undefined ? undefined : searchIndexFingerprint(header, snapshot);
+		const table = fingerprint === undefined ? undefined : await this.searchIndexTable();
+		if (fingerprint !== undefined && table !== undefined) {
+			const cached = usableSearchIndexRecord(table.get(sessionId), sessionId, fingerprint);
+			if (cached !== undefined) {
+				await check();
+				return cached.messages;
+			}
+		}
+		const messages = extractConversation(await this.readConversationEvents(sessionId));
+		await check();
+		let currentFingerprint = fingerprint;
+		if (fingerprint !== undefined && persistence !== undefined && typeof persistence.stat === "function") {
+			try {
+				const after = await persistence.stat(sessionId);
+				const afterHeader = after?.header ?? header;
+				currentFingerprint = afterHeader === undefined ? undefined : searchIndexFingerprint(afterHeader, after);
+			} catch (error) {
+				this.ctx.logger.warn(`archive-manager: post-read stat failed for search cache "${sessionId}": ${errorMessage(error)}`);
+				currentFingerprint = undefined;
+			}
+		}
+		if (currentFingerprint !== undefined && currentFingerprint === fingerprint && table !== undefined && header !== undefined) {
+			const record = createSearchIndexRecord(sessionId, currentFingerprint, messages);
+			if (record !== undefined) {
+				try { await table.put(sessionId, record); }
+				catch (error) { this.ctx.logger.warn(`archive-manager: search index write failed for "${sessionId}": ${errorMessage(error)}`); }
+			}
+		}
+		return messages;
+	}
+	/** 已归档与未归档共用正文检索；只读已知会话，不激活或改变归档状态。 */
+	async searchSessionContent(input: unknown) {
+		const { sessionIds, query } = searchInputSchema.parse(input);
+		const results = await mapSettledConcurrent(sessionIds, SEARCH_SESSION_CONCURRENCY, (sessionId) => this.readConversationForSearch(sessionId).then((messages) => findContentMatch(messages, query)));
+		const items: { sessionId: string; seq: number; snippet: string }[] = [];
+		const failures: { sessionId: string; message: string }[] = [];
+		results.forEach((result, index) => {
+			const sessionId = sessionIds[index];
+			if (result.status === "rejected") failures.push({ sessionId, message: errorMessage(result.reason).slice(0, 500) });
+			else if (result.value) items.push({ sessionId, ...result.value });
+		});
+		return { items, failures };
+	}
+	/** 输入为限定批次的归档 ID 和关键词，有界并发返回命中或失败。 */
+	async searchArchivedContent(input: unknown) {
+		const { sessionIds, query } = searchInputSchema.parse(input);
+		const results = await mapSettledConcurrent(sessionIds, SEARCH_SESSION_CONCURRENCY, (sessionId) => this.readConversationForSearch(sessionId, { archived: true }).then((messages) => findContentMatch(messages, query)));
+		const items: { sessionId: string; seq: number; snippet: string }[] = [];
+		const failures: { sessionId: string; message: string }[] = [];
+		results.forEach((result, index) => {
+			const sessionId = sessionIds[index];
+			if (result.status === "rejected") failures.push({ sessionId, message: errorMessage(result.reason).slice(0, 500) });
+			else if (result.value) items.push({ sessionId, ...result.value });
+		});
 		return { items, failures };
 	}
 	/** 返回最近八条对话或关键词附近的八条，单条最多 2000 字，不写入宿主数据。 */
@@ -806,6 +950,355 @@ var ArchiveWorkspaceRegistry = class extends (WorkspaceRegistry as unknown as Re
 	async unarchiveSession(sessionId: string) {
 		await super.unarchiveSession(sessionId);
 		return { archivedSessionIds: [...this.requireState().archivedSessionIds] };
+	}
+	async trashDomain() {
+		this.trashDomainPromise ??= openOptionalDomain(this.ctx, trashDomainSpec);
+		const domain = await this.trashDomainPromise;
+		if (domain === undefined) throw new Error("回收站存储不可用，请检查宿主存储服务");
+		return domain;
+	}
+	async trashTable() {
+		const domain = await this.trashDomain();
+		const table = domain.table("entries");
+		if (table === undefined) throw new Error("回收站记录表不可用");
+		return table as unknown as {
+			size: number;
+			get(key: string): unknown;
+			entries(): IterableIterator<[string, unknown]>;
+			put(key: string, value: unknown): Promise<void>;
+			delete(key: string): Promise<unknown>;
+		};
+	}
+	async deleteSearchIndexRecord(sessionId: string) {
+		try {
+			const table = await this.searchIndexTable();
+			await (table as unknown as { delete?(key: string): Promise<unknown> } | undefined)?.delete?.(sessionId);
+		} catch (error) {
+			this.ctx.logger.warn(`archive-manager: search index cleanup failed for "${sessionId}": ${errorMessage(error)}`);
+		}
+	}
+	async favoriteIdSet() {
+		const domain = await this.favoriteDomain();
+		return new Set(favoriteStateSchema.parse(domain.global.get()).favoriteSessionIds);
+	}
+	async setFavoritePresence(sessionId: string, favorite: boolean) {
+		const domain = await this.favoriteDomain();
+		const state = favoriteStateSchema.parse(domain.global.get());
+		const ids = new Set(state.favoriteSessionIds);
+		if (favorite) ids.add(sessionId); else ids.delete(sessionId);
+		if (ids.size === state.favoriteSessionIds.length && (favorite ? state.favoriteSessionIds.includes(sessionId) : !state.favoriteSessionIds.includes(sessionId))) return;
+		await domain.global.set({ favoriteSessionIds: [...ids] });
+	}
+	readCachedTitle(header: Header, sessionId: string) {
+		const cache = this.ctx.get("sessionProjectionCache");
+		try {
+			const values = cache?.cachedSnapshot?.(header)?.values as Record<string, unknown> | undefined;
+			if (values !== undefined && typeof values.title === "string" && values.title.trim() !== "") return values.title.slice(0, 500);
+		} catch {}
+		const live = this.ctx.get("sessions")?.get(sessionId) as unknown as { title?: unknown } | undefined;
+		return typeof live?.title === "string" && live.title.trim() !== "" ? live.title.slice(0, 500) : undefined;
+	}
+	captureWorkspaceLocation(sessionId: string) {
+		const state = this.requireState();
+		const table = this.requireTable();
+		for (const workspaceId of state.workspaceIds) {
+			const record = table.get(workspaceId);
+			const index = record?.sessionIds.indexOf(sessionId) ?? -1;
+			if (index >= 0) return { workspaceId, workspaceIndex: index };
+		}
+		return {};
+	}
+	/** Resolve the exact artifact that may be moved without crossing an owned-directory boundary. */
+	async resolveTrashSource(sessionId: string) {
+		const persistence = this.ctx.get("sessionPersistence");
+		if (persistence === void 0 || typeof persistence.locate !== "function") throw new Error("当前宿主无法定位会话工件，不能移入回收站");
+		const header = this.headers.get(sessionId) ?? await this.readSessionHeader(sessionId);
+		const location = persistence.locate(header);
+		if (location === undefined || typeof location.path !== "string") throw new Error(`无法定位会话 "${sessionId}" 的工件`);
+		const directory = jsonlSessionDirectory(persistence, header, location);
+		if (directory !== undefined) {
+			for (const path of [dirname(directory), directory]) await assertRealDirectory(path);
+			return { header, path: directory, kind: "session directory" };
+		}
+		if (persistence.name === "session-persistence-jsonl") {
+			this.ctx.logger.warn(`archive-manager: session "${sessionId}": JSONL directory ownership could not be verified; moving only the artifact at "${location.path}"`);
+		}
+		return { header, path: location.path, kind: "transcript artifact" };
+	}
+	async trashSessionCore(sessionId: string): Promise<{ trashed: boolean; skipped?: boolean }> {
+		const table = await this.trashTable();
+		if (table.get(sessionId) !== undefined) return { trashed: true, skipped: true };
+		if (table.size >= MAX_TRASH_ENTRIES) throw new Error(`回收站最多保留 ${MAX_TRASH_ENTRIES} 个会话，请先永久清理旧条目`);
+		let retainedBytes = 0;
+		for (const [storedId, stored] of table.entries()) {
+			try { retainedBytes += trashEntrySchema.parse(stored).sizeBytes; }
+			catch (error) { this.ctx.logger.warn(`archive-manager: invalid trash record "${storedId}" excluded from size accounting: ${errorMessage(error)}`); }
+		}
+		if (!(await this.sessionKnown(sessionId))) throw new Error("会话不存在或已被删除");
+		const source = await this.resolveTrashSource(sessionId);
+		const header = source.header;
+		const state = this.requireState();
+		const location = this.captureWorkspaceLocation(sessionId);
+		let wasFavorite = false;
+		try { wasFavorite = (await this.favoriteIdSet()).has(sessionId); }
+		catch (error) { this.ctx.logger.warn(`archive-manager: favorite state read failed for trashed session "${sessionId}": ${errorMessage(error)}`); }
+		const sizeBytes = await estimatePathSize(source.path);
+		if (retainedBytes + sizeBytes > MAX_TRASH_BYTES) throw new Error("回收站已超过 1 GiB 容量，请先永久清理旧条目");
+		const title = this.readCachedTitle(header, sessionId);
+		const deletedAt = Date.now();
+		const sessions = this.ctx.get("sessions");
+		const live = sessions?.get(sessionId);
+		if (live !== void 0) {
+			await sessions.flush(live);
+			sessions.detachEntered(sessions.liveEntryFor(live));
+		} else if (sessions !== void 0) {
+			await this.publishColdSessionRemoval(sessionId, sessions);
+		}
+		const root = archiveManagerTrashRoot();
+		await mkdir(root, { recursive: true });
+		await assertRealDirectory(root);
+		const entryDir = join(root, `${trashSessionSegment(sessionId)}-${randomUUID()}`);
+		await mkdir(entryDir, { recursive: false });
+		const artifactPath = join(entryDir, trashArtifactName(source.kind));
+		try {
+			const sourceStat = await lstat(source.path);
+			if (sourceStat.isSymbolicLink()) throw new Error("会话工件是符号链接，拒绝移入回收站");
+			await movePath(source.path, artifactPath);
+		} catch (error) {
+			await rm(entryDir, { recursive: true, force: true }).catch(() => {});
+			throw error;
+		}
+		const entry: TrashEntry = {
+			sessionId,
+			header: JSON.parse(JSON.stringify(header)) as Record<string, unknown>,
+			...(title === undefined ? {} : { title }),
+			deletedAt,
+			expiresAt: deletedAt + TRASH_RETENTION_MS,
+			sizeBytes,
+			originalPath: source.path,
+			trashPath: entryDir,
+			artifactKind: source.kind,
+			...(location.workspaceId === undefined ? {} : { workspaceId: location.workspaceId }),
+			...(location.workspaceIndex === undefined ? {} : { workspaceIndex: location.workspaceIndex }),
+			wasArchived: state.archivedSessionIds.includes(sessionId),
+			wasFavorite,
+		};
+		try {
+			await table.put(sessionId, trashEntrySchema.parse(entry));
+		} catch (error) {
+			await movePath(artifactPath, source.path).catch((rollbackError) => {
+				this.ctx.logger.warn(`archive-manager: could not roll back trashed artifact "${sessionId}": ${errorMessage(rollbackError)}`);
+			});
+			await rm(entryDir, { recursive: true, force: true }).catch(() => {});
+			throw error;
+		}
+		const projCache = this.ctx.get("sessionProjectionCache");
+		if (projCache !== void 0) {
+			try { await projCache.requireTable().delete(sessionId); }
+			catch (error) { this.ctx.logger.warn(`archive-manager: projection cache cleanup for trashed session "${sessionId}" failed: ${errorMessage(error)}`); }
+		}
+		await this.cleanSpill(sessionId);
+		await this.cleanupTrashedSessionBookkeeping(sessionId, entry.wasArchived, wasFavorite);
+		this.forgetIndexedSession(sessionId);
+		await this.deleteSearchIndexRecord(sessionId);
+		this.publishDeletedSession(sessionId);
+		return { trashed: true };
+	}
+	async cleanupTrashedSessionBookkeeping(sessionId: string, wasArchived: boolean, wasFavorite: boolean) {
+		if (wasArchived) {
+			try {
+				const state = this.requireState();
+				if (state.archivedSessionIds.includes(sessionId)) {
+					await this.setState({ ...state, archivedSessionIds: state.archivedSessionIds.filter((id) => id !== sessionId) });
+				}
+			} catch (error) {
+				this.ctx.logger.warn(`archive-manager: archive bookkeeping cleanup for trashed session "${sessionId}" failed: ${errorMessage(error)}`);
+			}
+		}
+		try { await this.removeFromWorkspaceAccounts(sessionId); }
+		catch (error) { this.ctx.logger.warn(`archive-manager: workspace bookkeeping cleanup for trashed session "${sessionId}" failed: ${errorMessage(error)}`); }
+		if (wasFavorite) {
+			try { await this.setFavoritePresence(sessionId, false); }
+			catch (error) { this.ctx.logger.warn(`archive-manager: favorite cleanup for trashed session "${sessionId}" failed: ${errorMessage(error)}`); }
+		}
+	}
+	async trashSession(sessionId: string) {
+		return this.enqueueOperation(async () => {
+			await this.trashSessionCore(sessionId);
+			return { trashed: true as const };
+		});
+	}
+	async trashArchivedSessions(target: unknown): Promise<TrashBatch> {
+		return this.enqueueOperation(async () => {
+			const requestedSessionIds = this.archivedSessionIdsForTarget(target);
+			const trashedSessionIds: string[] = [];
+			const skippedSessionIds: string[] = [];
+			const failures: { sessionId: string; message: string }[] = [];
+			for (const sessionId of requestedSessionIds) {
+				try {
+					const result = await this.trashSessionCore(sessionId);
+					if (result.skipped === true) skippedSessionIds.push(sessionId); else trashedSessionIds.push(sessionId);
+				} catch (error) {
+					failures.push({ sessionId, message: deletionFailureMessage(error) });
+				}
+			}
+			return { requestedSessionIds, trashedSessionIds, skippedSessionIds, failures };
+		});
+	}
+	async trashedSessions(): Promise<TrashList> {
+		const table = await this.trashTable();
+		const now = Date.now();
+		const items: TrashEntry[] = [];
+		for (const [sessionId, value] of table.entries()) {
+			try {
+				const parsed = trashEntrySchema.parse(value);
+				if (parsed.sessionId !== sessionId) continue;
+				items.push({ ...parsed, expired: parsed.expiresAt <= now });
+			} catch (error) {
+				this.ctx.logger.warn(`archive-manager: invalid trash record "${sessionId}" skipped: ${errorMessage(error)}`);
+			}
+		}
+		items.sort((left, right) => right.deletedAt - left.deletedAt);
+		return { retentionDays: TRASH_RETENTION_DAYS, items: items.slice(0, MAX_TRASH_ENTRIES) };
+	}
+	validateTrashEntryPath(entry: TrashEntry) {
+		const root = resolve(archiveManagerTrashRoot());
+		const trashPath = resolve(entry.trashPath);
+		if (!pathWithin(root, trashPath) || dirname(trashPath) !== root) throw new Error("回收站条目路径越界");
+		if (!isAbsolute(entry.originalPath) || pathWithin(root, entry.originalPath)) throw new Error("回收站原始路径无效");
+		return { root, entryDir: trashPath, artifactPath: join(trashPath, trashArtifactName(entry.artifactKind)) };
+	}
+	async restoreOriginalPath(header: Header, entry: TrashEntry) {
+		const persistence = this.ctx.get("sessionPersistence");
+		if (persistence === undefined || typeof persistence.locate !== "function") throw new Error("当前宿主无法定位会话工件，不能恢复");
+		const location = persistence.locate(header);
+		if (location === undefined || typeof location.path !== "string") throw new Error("无法定位会话的原始工件路径");
+		const expected = entry.artifactKind === "session directory" ? jsonlSessionDirectory(persistence, header, location) : location.path;
+		if (expected === undefined || resolve(expected) !== resolve(entry.originalPath)) throw new Error("会话存储路径已变化，拒绝恢复到不同位置");
+		return resolve(entry.originalPath);
+	}
+	async restoreWorkspaceLocation(sessionId: string, workspaceId: string | undefined, workspaceIndex: number | undefined) {
+		if (workspaceId === undefined) return;
+		const table = this.requireTable();
+		const record = table.get(workspaceId);
+		if (record === undefined || record.sessionIds.includes(sessionId)) return;
+		const index = Math.max(0, Math.min(workspaceIndex ?? record.sessionIds.length, record.sessionIds.length));
+		const next = await table.update(workspaceId, (current) => {
+			const sessionIds = [...current.sessionIds];
+			sessionIds.splice(index, 0, sessionId);
+			return { ...current, sessionIds, updatedAt: new Date().toISOString() };
+		});
+		const entity = this.entities.get(workspaceId);
+		if (entity !== undefined) entity.record = next;
+	}
+	async rebuildRestoredProjection(sessionId: string, header: Header) {
+		const cache = this.ctx.get("sessionProjectionCache");
+		const persistence = this.ctx.get("sessionPersistence");
+		if (cache === undefined || persistence === undefined || typeof cache.coldSnapshot !== "function" || typeof persistence.open !== "function") return;
+		try {
+			if (!(await this.cacheRebuildEligible(header))) return;
+			const source = await this.readStoredProjectionSource(persistence, sessionId);
+			await confirmColdCacheWrite(cache, source);
+		} catch (error) {
+			this.ctx.logger.warn(`archive-manager: projection rebuild after restoring "${sessionId}" failed: ${errorMessage(error)}`);
+		}
+	}
+	async restoreTrashedSessionCore(sessionId: string): Promise<{ restored: boolean; skipped?: boolean }> {
+		const table = await this.trashTable();
+		const raw = table.get(sessionId);
+		if (raw === undefined) throw new Error("回收站中没有该会话");
+		const entry = trashEntrySchema.parse(raw);
+		const { entryDir, artifactPath } = this.validateTrashEntryPath(entry);
+		const header = entry.header as unknown as Header;
+		const originalPath = await this.restoreOriginalPath(header, entry);
+		let artifactPresent = false;
+		let originalPresent = await pathExists(originalPath);
+		try {
+			const entryStat = await lstat(entryDir);
+			if (entryStat.isSymbolicLink() || !entryStat.isDirectory()) throw new Error("回收站条目不是普通目录，拒绝恢复");
+			const sourceStat = await lstat(artifactPath);
+			if (sourceStat.isSymbolicLink()) throw new Error("回收站工件是符号链接，拒绝恢复");
+			artifactPresent = true;
+		} catch (error) {
+			if (errorCode(error) !== "ENOENT") throw error;
+		}
+		if (artifactPresent) {
+			if (originalPresent) throw new Error(`恢复目标已存在："${originalPath}"`);
+			const parent = dirname(originalPath);
+			await mkdir(parent, { recursive: true });
+			await assertRealDirectory(parent);
+			await movePath(artifactPath, originalPath);
+			originalPresent = true;
+		} else if (!originalPresent) {
+			throw new Error("回收站工件与原始路径均不存在，无法恢复");
+		}
+		try { await this.indexHeader(header); }
+		catch (error) { this.ctx.logger.warn(`archive-manager: restored session "${sessionId}" could not be indexed: ${errorMessage(error)}`); }
+		const state = this.requireState();
+		if (entry.wasArchived && !state.archivedSessionIds.includes(sessionId)) {
+			await this.setState({ ...state, archivedSessionIds: [...state.archivedSessionIds, sessionId] });
+		}
+		await this.restoreWorkspaceLocation(sessionId, entry.workspaceId, entry.workspaceIndex);
+		if (entry.wasFavorite) await this.setFavoritePresence(sessionId, true);
+		await rm(entryDir, { recursive: true, force: true });
+		await table.delete(sessionId);
+		await this.rebuildRestoredProjection(sessionId, header);
+		return { restored: true };
+	}
+	async restoreTrashedSessions(input: unknown): Promise<TrashRestoreResult> {
+		const { sessionIds } = trashIdsSchema.parse(input);
+		return this.enqueueOperation(async () => {
+			const restoredSessionIds: string[] = [];
+			const skippedSessionIds: string[] = [];
+			const failures: { sessionId: string; message: string }[] = [];
+			for (const sessionId of sessionIds) {
+				try {
+					const result = await this.restoreTrashedSessionCore(sessionId);
+					if (result.skipped === true) skippedSessionIds.push(sessionId); else restoredSessionIds.push(sessionId);
+				} catch (error) {
+					failures.push({ sessionId, message: deletionFailureMessage(error) });
+				}
+			}
+			return { restoredSessionIds, skippedSessionIds, failures };
+		});
+	}
+	async purgeTrashedSessionCore(sessionId: string, entry: TrashEntry) {
+		const { entryDir } = this.validateTrashEntryPath(entry);
+		try {
+			const stat = await lstat(entryDir);
+			if (stat.isSymbolicLink()) throw new Error("回收站条目是符号链接，拒绝永久清理");
+		} catch (error) {
+			if (errorCode(error) !== "ENOENT") throw error;
+		}
+		await rm(entryDir, { recursive: true, force: true });
+		await this.cleanupTrashedSessionBookkeeping(sessionId, entry.wasArchived, entry.wasFavorite);
+		await this.deleteSearchIndexRecord(sessionId);
+		await (await this.trashTable()).delete(sessionId);
+	}
+	async purgeTrashedSessions(input: unknown): Promise<TrashPurgeResult> {
+		const selection = purgeTrashSchema.parse(input);
+		return this.enqueueOperation(async () => {
+			const table = await this.trashTable();
+			const available = new Map<string, TrashEntry>();
+			for (const [sessionId, value] of table.entries()) {
+				try { available.set(sessionId, trashEntrySchema.parse(value)); }
+				catch (error) { this.ctx.logger.warn(`archive-manager: invalid trash record "${sessionId}" skipped during purge: ${errorMessage(error)}`); }
+			}
+			const sessionIds = selection.all === true ? [...available.keys()] : selection.sessionIds;
+			const purgedSessionIds: string[] = [];
+			const failures: { sessionId: string; message: string }[] = [];
+			for (const sessionId of sessionIds) {
+				try {
+					const entry = available.get(sessionId);
+					if (entry === undefined) throw new Error("回收站中没有该会话");
+					await this.purgeTrashedSessionCore(sessionId, entry);
+					purgedSessionIds.push(sessionId);
+				} catch (error) {
+					failures.push({ sessionId, message: deletionFailureMessage(error) });
+				}
+			}
+			return { purgedSessionIds, failures };
+		});
 	}
 	/**
 	 * 按作用域永久删除归档会话。跨会话文件删除无法组成事务，因此继续处理

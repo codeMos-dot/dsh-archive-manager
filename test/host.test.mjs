@@ -218,7 +218,9 @@ function buildRoot({
 		announced: [],
 	};
 	const favoriteDomain = new FakeDomain({}, { favoriteSessionIds: [] });
-	ctx.provide("storageDomain", { open: async (spec) => spec.name === "archive_manager_favorites" ? favoriteDomain : domain });
+	const searchIndexDomain = new FakeDomain({ sessions: new FakeTable() }, {});
+	const trashDomain = new FakeDomain({ entries: new FakeTable() }, {});
+	ctx.provide("storageDomain", { open: async (spec) => spec.name === "archive_manager_favorites" ? favoriteDomain : spec.name === "archive_manager_search_index" ? searchIndexDomain : spec.name === "archive_manager_trash" ? trashDomain : domain });
 	ctx.provide("sessionPersistence", persistence);
 	ctx.provide("sessionProjectionCache", projCache);
 	ctx.provide("sessions", sessions);
@@ -235,6 +237,8 @@ function buildRoot({
 		sessions,
 		located,
 		favoriteDomain,
+		searchIndexDomain,
+		trashDomain,
 	};
 }
 
@@ -1982,6 +1986,33 @@ test("归档检索与预览只读日志，不激活会话、不修改归档或�
   await assert.rejects(registry.previewArchivedSession({ sessionId: s3 }), /归档/);
 });
 
+test("归档正文检索有界并发读取，保持结果与失败顺序", async () => {
+	const ids = [s1, s2, s3, s4, s5];
+	const env = buildRoot({ headers: ids.map((id) => header(id)), archived: ids });
+	const registry = await mountWorkspaceRegistry(env);
+	let active = 0, maxActive = 0;
+	env.persistence.open = async (id) => {
+		active++;
+		maxActive = Math.max(maxActive, active);
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			if (id === s2) throw new Error("损坏日志");
+			return {
+				header: header(id),
+				inheritedEventCount: 0,
+				read: async () => ({ events: [{ type: "user/message", seq: 0, data: { content: "订单退款" } }] }),
+				close: async () => {},
+			};
+		} finally {
+			active--;
+		}
+	};
+	const result = await registry.searchArchivedContent({ sessionIds: ids, query: "订单" });
+	assert.equal(maxActive, 4, "单批最多读取四个会话");
+	assert.deepEqual(result.items.map((item) => item.sessionId), [s1, s3, s4, s5]);
+	assert.deepEqual(result.failures.map((failure) => failure.sessionId), [s2]);
+});
+
 test("新版预览关闭只读句柄，失败也关闭，期间恢复的会话不返回旧内容", async () => {
   const env = buildRoot({ headers: [header(s1)], archived: [s1] });
   const registry = await mountWorkspaceRegistry(env);
@@ -2005,4 +2036,200 @@ test('未归档正文搜索读取已知会话且不改变归档状态', async()=
  assert.equal(result.items[0].sessionId,s1);
  assert.deepEqual(env.global.archivedSessionIds,[]);
  assert.deepEqual(env.persistence.prepared,[]);
+});
+
+test("全文索引按持久化 revision 复用，读取期间变化时拒绝写入旧内容", async () => {
+	const env = buildRoot({ headers: [header(s1)], archived: [s1] });
+	const registry = await mountWorkspaceRegistry(env);
+	let revision = "r1";
+	let reads = 0;
+	env.persistence.stat = async () => ({ header: header(s1), revision, eventCount: 1, sizeBytes: 32 });
+	env.persistence.open = async () => ({
+		header: header(s1),
+		inheritedEventCount: 0,
+		read: async () => {
+			reads += 1;
+			return { events: [{ seq: 0, type: "user/message", data: { content: `缓存正文 ${revision}` } }] };
+		},
+		close: async () => {},
+	});
+	const table = env.searchIndexDomain.table("sessions");
+
+	const first = await registry.searchArchivedContent({ sessionIds: [s1], query: "缓存正文" });
+	assert.equal(first.items[0].sessionId, s1);
+	assert.equal(reads, 1, "首次搜索读取日志");
+	const firstRecord = table.get(s1);
+	assert.equal(firstRecord.sessionId, s1);
+	assert.equal(firstRecord.messages[0].text, "缓存正文 r1");
+
+	await registry.searchArchivedContent({ sessionIds: [s1], query: "缓存正文" });
+	assert.equal(reads, 1, "revision 未变时命中持久索引，不再读日志");
+	assert.equal(table.get(s1).fingerprint, firstRecord.fingerprint);
+
+	revision = "r2";
+	await registry.searchArchivedContent({ sessionIds: [s1], query: "缓存正文" });
+	assert.equal(reads, 2, "revision 改变后重新读取并刷新索引");
+	assert.notEqual(table.get(s1).fingerprint, firstRecord.fingerprint);
+	assert.equal(table.get(s1).messages[0].text, "缓存正文 r2");
+
+	const retained = table.get(s1).fingerprint;
+	const changing = ["r3", "r4"];
+	env.persistence.stat = async () => ({ header: header(s1), revision: changing.shift() ?? "r4", eventCount: 2, sizeBytes: 48 });
+	await registry.searchArchivedContent({ sessionIds: [s1], query: "缓存正文" });
+	assert.equal(reads, 3, "revision 变化后仍会读取当前日志");
+	assert.equal(table.get(s1).fingerprint, retained, "读取期间会话再次变化时不得写回旧索引");
+});
+
+test("全文索引写入失败时仍返回当前搜索结果", async () => {
+	const env = buildRoot({ headers: [header(s1)], archived: [s1] });
+	const registry = await mountWorkspaceRegistry(env);
+	env.persistence.stat = async () => ({ header: header(s1), revision: "r1", eventCount: 1, sizeBytes: 32 });
+	env.persistence.open = async () => ({
+		header: header(s1),
+		inheritedEventCount: 0,
+		read: async () => ({ events: [{ seq: 0, type: "user/message", data: { content: "索引写入失败仍可搜索" } }] }),
+		close: async () => {},
+	});
+	const table = env.searchIndexDomain.table("sessions");
+	table.put = async () => { throw new Error("disk full"); };
+
+	const result = await registry.searchArchivedContent({ sessionIds: [s1], query: "仍可搜索" });
+
+	assert.equal(result.items[0].sessionId, s1);
+	assert.deepEqual(result.failures, []);
+	assert.equal(table.get(s1), undefined, "写入失败不应留下半成品索引");
+});
+
+test("回收站移入、恢复和永久清理同步归档、工作区与收藏状态", async () => {
+	const previousHome = process.env.DSH_HOME;
+	const env = buildRoot({
+		headers: [header(s1, cwdA)],
+		workspaces: { [A]: workspace("D:\\proj-a", [s1]) },
+		archived: [s1],
+	});
+	process.env.DSH_HOME = join(env.root, "dsh-home");
+	try {
+		const registry = await mountWorkspaceRegistry(env);
+		await registry.setSessionFavorite({ sessionId: s1, favorite: true });
+		const original = env.located.get(s1);
+		assert.equal(existsSync(original), true);
+
+		await registry.trashSession(s1);
+		assert.equal(existsSync(original), false, "移入回收站后原工件不存在");
+		assert.deepEqual(env.global.archivedSessionIds, [], "移入回收站同时移出归档");
+		assert.deepEqual(env.table.get(A).sessionIds, [], "移入回收站同时移出工作区");
+		assert.deepEqual(env.favoriteDomain.global.get().favoriteSessionIds, [], "移入回收站同时移出收藏");
+		const listed = await registry.trashedSessions();
+		assert.equal(listed.retentionDays, 30);
+		assert.equal(listed.items.length, 1);
+		assert.equal(listed.items[0].sessionId, s1);
+		assert.equal(listed.items[0].expired, false);
+		assert.ok(listed.items[0].sizeBytes > 0);
+		assert.equal(existsSync(listed.items[0].trashPath), true);
+
+		const restored = await registry.restoreTrashedSessions({ sessionIds: [s1] });
+		assert.deepEqual(restored.restoredSessionIds, [s1]);
+		assert.deepEqual(restored.failures, []);
+		assert.equal(existsSync(original), true, "恢复回原始工件路径");
+		assert.deepEqual(env.global.archivedSessionIds, [s1], "恢复原归档状态");
+		assert.deepEqual(env.table.get(A).sessionIds, [s1], "恢复原工作区位置");
+		assert.deepEqual(env.favoriteDomain.global.get().favoriteSessionIds, [s1], "恢复原收藏状态");
+		assert.deepEqual((await registry.trashedSessions()).items, []);
+
+		await registry.trashSession(s1);
+		const purged = await registry.purgeTrashedSessions({ sessionIds: [s1] });
+		assert.deepEqual(purged.purgedSessionIds, [s1]);
+		assert.equal(existsSync(original), false, "永久清理不恢复工件");
+		assert.deepEqual((await registry.trashedSessions()).items, []);
+		assert.deepEqual(env.global.archivedSessionIds, []);
+	} finally {
+		if (previousHome === undefined) delete process.env.DSH_HOME;
+		else process.env.DSH_HOME = previousHome;
+	}
+});
+
+test("回收站拒绝路径越界与已存在的恢复目标，并标记过期条目", async () => {
+	const previousHome = process.env.DSH_HOME;
+	const env = buildRoot({ headers: [header(s1)] });
+	process.env.DSH_HOME = join(env.root, "dsh-home-limits");
+	try {
+		const registry = await mountWorkspaceRegistry(env);
+		const original = env.located.get(s1);
+		await registry.trashSession(s1);
+		const table = env.trashDomain.table("entries");
+		const valid = table.get(s1);
+		const expired = { ...valid, expiresAt: Date.now() - 1 };
+		table.map.set(s1, expired);
+		assert.equal((await registry.trashedSessions()).items[0].expired, true);
+
+		table.map.set(s1, { ...expired, trashPath: join(env.root, "outside") });
+		const escaped = await registry.restoreTrashedSessions({ sessionIds: [s1] });
+		assert.match(escaped.failures[0].message, /路径越界/);
+
+		table.map.set(s1, valid);
+		writeFileSync(original, "conflict");
+		const conflict = await registry.restoreTrashedSessions({ sessionIds: [s1] });
+		assert.match(conflict.failures[0].message, /恢复目标已存在/);
+		assert.deepEqual((await registry.trashedSessions()).items.map((item) => item.sessionId), [s1], "失败时保留回收站记录");
+	} finally {
+		if (previousHome === undefined) delete process.env.DSH_HOME;
+		else process.env.DSH_HOME = previousHome;
+	}
+});
+
+test("回收站遵守 100 条与 1 GiB 容量上限", async () => {
+	const previousHome = process.env.DSH_HOME;
+	const env = buildRoot({ headers: [header(s1)] });
+	process.env.DSH_HOME = join(env.root, "dsh-home-capacity");
+	try {
+		const registry = await mountWorkspaceRegistry(env);
+		const table = env.trashDomain.table("entries");
+		const root = join(process.env.DSH_HOME, "archive-manager", "trash");
+		const entry = (index, sizeBytes = 0) => ({
+			sessionId: `trash-${index}`,
+			header: { id: `trash-${index}` },
+			deletedAt: Date.now(),
+			expiresAt: Date.now() + 1000,
+			sizeBytes,
+			originalPath: "C:\\sessions\\fixture.jsonl.zstd",
+			trashPath: join(root, `trash-${index}`),
+			artifactKind: "transcript artifact",
+			wasArchived: false,
+			wasFavorite: false,
+		});
+		for (let index = 0; index < 100; index += 1) table.map.set(`trash-${index}`, entry(index));
+		await assert.rejects(registry.trashSession(s1), /最多保留 100 个会话/);
+
+		table.map.clear();
+		table.map.set("oversized", entry("oversized", 1024 * 1024 * 1024 + 1));
+		await assert.rejects(registry.trashSession(s1), /1 GiB/);
+	} finally {
+		if (previousHome === undefined) delete process.env.DSH_HOME;
+		else process.env.DSH_HOME = previousHome;
+	}
+});
+
+test("回收站恢复与永久清理拒绝符号链接条目", async () => {
+	const previousHome = process.env.DSH_HOME;
+	const env = buildRoot({ headers: [header(s1)], archived: [s1] });
+	process.env.DSH_HOME = join(env.root, "dsh-home-symlink");
+	try {
+		const registry = await mountWorkspaceRegistry(env);
+		await registry.trashSession(s1);
+		const entry = (await registry.trashedSessions()).items[0];
+		const external = join(env.root, "external-trash");
+		renameSync(entry.trashPath, external);
+		symlinkSync(external, entry.trashPath, process.platform === "win32" ? "junction" : "dir");
+
+		const restored = await registry.restoreTrashedSessions({ sessionIds: [s1] });
+		assert.match(restored.failures[0].message, /不是普通目录/);
+
+		const purged = await registry.purgeTrashedSessions({ sessionIds: [s1] });
+		assert.match(purged.failures[0].message, /符号链接/);
+		assert.equal(existsSync(join(external, "artifact")), true, "链接目标不得被删除");
+		assert.deepEqual((await registry.trashedSessions()).items.map((item) => item.sessionId), [s1], "失败条目保留供重试");
+	} finally {
+		if (previousHome === undefined) delete process.env.DSH_HOME;
+		else process.env.DSH_HOME = previousHome;
+	}
 });

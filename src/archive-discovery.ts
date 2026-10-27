@@ -157,6 +157,25 @@ export function matchesUpdatedRange(value: string | number | undefined, from: st
   const time = typeof value === "number" ? value : Date.parse(value ?? "");
   return Number.isFinite(time) && (!from || time >= dayBoundary(from)) && (!to || time < dayBoundary(to, true));
 }
+/**
+ * 以固定并发度执行异步任务，按输入顺序返回全部结果。
+ * 单个任务失败不会中断其他读取，供正文检索隔离损坏或消失的会话。
+ */
+export async function mapSettledConcurrent<T, R>(items: readonly T[], concurrency: number, run: (item: T, index: number) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new TypeError("并发数必须为正整数");
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      try { results[index] = { status: "fulfilled", value: await run(items[index], index) }; }
+      catch (reason) { results[index] = { status: "rejected", reason }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+}
 /** 顺序分批限制宿主瞬时负载；取消会阻止后续批次和迟到结果发布。 */
 export async function searchArchiveBatches(ids: readonly string[], query: string, call: (input: SearchInput) => Promise<unknown>, { signal, onProgress }: { signal?: AbortSignal; onProgress?: (progress: SearchProgress) => void } = {}) {
   const items: SearchHit[] = [], failures: Failure[] = [];

@@ -25,10 +25,15 @@ const ARCHIVE_ENDPOINTS = [
 	"favoriteSessions",
 	"moveSessionToWorkspace",
 	"previewArchivedSession",
+	"purgeTrashedSessions",
 	"rebuildSessionCaches",
+	"restoreTrashedSessions",
 	"searchArchivedContent",
 	"searchSessionContent",
 	"setSessionFavorite",
+	"trashArchivedSessions",
+	"trashSession",
+	"trashedSessions",
 	"unarchiveSession",
 ];
 

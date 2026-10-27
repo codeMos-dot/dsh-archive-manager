@@ -4,6 +4,13 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createOrganizerPanel, organizerZh, organizerEn, organizerRu } from '../src/archive-organizer-ui.ts';
 const translate = (key, values = {}) => Object.entries(values).reduce((s, [k,v]) => s.replaceAll(`{${k}}`, String(v)), organizerZh[key] ?? key);
+async function waitFor(condition, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error("等待重试结果超时");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
 
 test('Issue88 cache card is conditional and uses the existing organizer style/action', () => {
   const Panel = createOrganizerPanel(React);
@@ -59,7 +66,7 @@ test('Issue88 controller retries diagnostic load if remote service is temporaril
     refresh: async () => {}
   }, { maxLoadRetries: 3, retryDelayMs: 20 });
   await controller.load();
-  await new Promise(r => setTimeout(r, 100));
+  await waitFor(() => controller.snapshot().diagnosis.count === 1 && controller.snapshot().error === null);
   assert.equal(controller.snapshot().diagnosis.count, 1);
   assert.equal(controller.snapshot().error, null);
   controller.dispose();

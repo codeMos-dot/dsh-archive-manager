@@ -839,3 +839,139 @@ test("批量删除进行中不再重读剩余会话的详情和创建时间", as
     globalThis.window = previousWindow;
   }
 });
+
+test("1000 条归档会话按 200 条渐进渲染，折叠、搜索与全选沿用完整列表", () => {
+  const values = []; let cursor = 0;
+  const effects = [];
+  const hooks = { ...statics.react,
+    useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
+    useState: initial => { const i = cursor++; if (!(i in values)) values[i] = typeof initial === "function" ? initial() : initial; return [values[i], next => { values[i] = typeof next === "function" ? next(values[i]) : next; }]; },
+    useRef: initial => { const i = cursor++; return values[i] ??= { current: initial }; },
+    useMemo: fn => fn(),
+    useEffect: (fn, deps) => { const i = cursor++; if (!values[i] || !deps || !values[i].deps || deps.some((value, index) => !Object.is(value, values[i].deps[index]))) { values[i] = { deps }; effects.push(fn); } }
+  };
+  const client = factories.get("@michengai/dsh-archive-manager")(name => name === "react" ? hooks : statics[name]);
+  const ids = Array.from({ length: 1000 }, (_, index) => `archived-${String(index).padStart(4, "0")}`);
+  const state = { items: [{ workspaceId: "large", title: "Large", sessionIds: ids }], archivedSessionIds: ids };
+  const sessionState = { byId: Object.fromEntries(ids.map((id, index) => [id, { id, title: id, updatedAt: index + 1 }])) };
+  const props = { sessionStore: source(sessionState), workspaceStore: source(state), archivedSessionMetadata: async () => ({ items: [] }), t: key => key };
+  const nodes = node => Array.isArray(node) ? node.flatMap(nodes) : node?.props ? [node, ...nodes(node.props.children)] : [];
+  let tree;
+  const render = () => { cursor = 0; tree = client.__test.ArchivedSessionsSection(props); while (effects.length) effects.shift()(); };
+  const rows = () => nodes(tree).filter(node => node.props?.className === "dsham_settingsRow");
+  const showMore = () => nodes(tree).find(node => node.props?.className === "dsham_settingsMore")?.props.children;
+  render();
+  assert.equal(client.__test.ARCHIVE_RENDER_BATCH, 200);
+  assert.equal(rows().length, 200, "首屏每组只渲染 200 条");
+  assert.ok(showMore(), "仍有剩余会话时显示更多按钮");
+  showMore().props.onClick(); render();
+  assert.equal(rows().length, 400, "点击显示更多只追加下一批");
+
+  const toggle = () => nodes(tree).find(node => node.props?.className === "dsham_groupToggle");
+  toggle().props.onClick(); render();
+  assert.equal(rows().length, 0, "折叠后不渲染行");
+  toggle().props.onClick(); render();
+  assert.equal(rows().length, 400, "展开后保留已追加的渲染数量");
+
+  const selectAll = nodes(tree).find(node => node.props?.visibleCount === 1000 && typeof node.props.onToggle === "function");
+  selectAll.props.onToggle(true);
+  render();
+  const toolbar = nodes(tree).find(node => node.props?.visibleCount === 1000 && typeof node.props.onToggle === "function");
+  assert.equal(toolbar.props.selectedCount, 1000, "全选基于筛选后的完整 1000 条，而不是仅已渲染的 400 条");
+
+  const search = nodes(tree).find(node => node.props?.id === "dsham-search-input");
+  search.props.onChange({ target: { value: "archived-" } });
+  render(); render();
+  assert.equal(rows().length, 200, "搜索条件变化后渐进渲染数量重置为首批");
+});
+
+test("回收站弹窗支持多选恢复、永久清理与过期标记", async () => {
+  const values = []; let cursor = 0;
+  const hooks = { ...statics.react,
+    useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
+    useState: initial => { const i = cursor++; if (!(i in values)) values[i] = typeof initial === "function" ? initial() : initial; return [values[i], next => { values[i] = typeof next === "function" ? next(values[i]) : next; }]; },
+    useRef: initial => { const i = cursor++; return values[i] ??= { current: initial }; },
+    useMemo: fn => fn(), useEffect: () => {}
+  };
+  const client = factories.get("@michengai/dsh-archive-manager")(name => name === "react" ? hooks : statics[name]);
+  let trashItems = [
+    { sessionId: "trash-a", header: { id: "trash-a" }, title: "Trash A", deletedAt: Date.now() - 2_000, expiresAt: Date.now() + 86_400_000, sizeBytes: 1024, originalPath: "C:\\a", trashPath: "C:\\trash-a", artifactKind: "transcript artifact", wasArchived: false, wasFavorite: false, expired: false },
+    { sessionId: "trash-b", header: { id: "trash-b" }, title: "Trash B", deletedAt: Date.now() - 4_000, expiresAt: Date.now() - 1, sizeBytes: 2048, originalPath: "C:\\b", trashPath: "C:\\trash-b", artifactKind: "transcript artifact", wasArchived: false, wasFavorite: false, expired: true }
+  ];
+  const calls = [];
+  const props = {
+    sessionStore: source({ byId: {} }), workspaceStore: source({ items: [], archivedSessionIds: [] }),
+    archivedSessionMetadata: async () => ({ items: [] }),
+    trashedSessions: async () => ({ retentionDays: 30, items: trashItems.map(item => ({ ...item })) }),
+    restoreTrashedSessions: async input => { calls.push(["restore", input]); trashItems = trashItems.filter(item => !input.sessionIds.includes(item.sessionId)); return { restoredSessionIds: [...input.sessionIds], skippedSessionIds: [], failures: [] }; },
+    purgeTrashedSessions: async input => { calls.push(["purge", input]); const purged = input.all === true ? trashItems.map(item => item.sessionId) : [...input.sessionIds]; trashItems = trashItems.filter(item => !purged.includes(item.sessionId)); return { purgedSessionIds: purged, failures: [] }; },
+    t: key => key
+  };
+  const nodes = node => Array.isArray(node) ? node.flatMap(nodes) : node?.props ? [node, ...nodes(node.props.children)] : [];
+  let tree;
+  const render = () => { cursor = 0; tree = client.__test.ArchivedSessionsSection(props); };
+  const modal = title => nodes(tree).find(node => node.props?.open === true && node.props?.title === title);
+  render();
+  nodes(tree).find(node => node.props?.["aria-label"] === "trash.open").props.onClick();
+  await tick(); render();
+  const trashModal = modal("trash.title");
+  assert.ok(trashModal, "标题栏按钮打开回收站");
+  const rows = nodes(trashModal.props.children).filter(node => node.props?.className === "dsham_trashRow");
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].props["data-expired"], undefined);
+  assert.equal(rows[1].props["data-expired"], true, "过期条目高亮但仍等待显式清理");
+
+  nodes(trashModal.props.children).find(node => node.props?.label === "trash.select" && typeof node.props.onChange === "function").props.onChange({ target: { checked: true } });
+  render();
+  const restoredModal = modal("trash.title");
+  await nodes(restoredModal.props.children).find(node => node.props?.children === "trash.restoreSelected" && typeof node.props.onClick === "function").props.onClick();
+  render();
+  assert.deepEqual(calls[0], ["restore", { sessionIds: ["trash-a"] }]);
+  assert.ok(nodes(tree).find(node => node.props?.children === "trash.restoreSuccess"));
+
+  const purgeModal = modal("trash.title");
+  nodes(purgeModal.props.children).find(node => node.props?.label === "trash.select" && typeof node.props.onChange === "function").props.onChange({ target: { checked: true } });
+  render();
+  nodes(modal("trash.title").props.children).find(node => node.props?.children === "trash.purgeSelected" && typeof node.props.onClick === "function").props.onClick();
+  render();
+  const confirm = modal("trash.purgeTitle");
+  assert.ok(confirm, "永久清理先打开二次确认");
+  assert.equal(calls.filter(([kind]) => kind === "purge").length, 0);
+  await nodes(confirm.props.footer).find(node => node.props?.children === "trash.purgeConfirm").props.onClick();
+  render();
+  assert.deepEqual(calls.at(-1), ["purge", { sessionIds: ["trash-b"] }]);
+  assert.deepEqual(trashItems, []);
+});
+
+test("清空回收站必须二次确认并提交 all 选择", async () => {
+  const values = []; let cursor = 0;
+  const hooks = { ...statics.react,
+    useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
+    useState: initial => { const i = cursor++; if (!(i in values)) values[i] = typeof initial === "function" ? initial() : initial; return [values[i], next => { values[i] = typeof next === "function" ? next(values[i]) : next; }]; },
+    useRef: initial => { const i = cursor++; return values[i] ??= { current: initial }; },
+    useMemo: fn => fn(), useEffect: () => {}
+  };
+  const client = factories.get("@michengai/dsh-archive-manager")(name => name === "react" ? hooks : statics[name]);
+  const calls = [];
+  const item = { sessionId: "trash-all", header: { id: "trash-all" }, title: "All", deletedAt: Date.now(), expiresAt: Date.now() + 1000, sizeBytes: 1, originalPath: "C:\\all", trashPath: "C:\\trash-all", artifactKind: "transcript artifact", wasArchived: false, wasFavorite: false, expired: false };
+  const props = {
+    sessionStore: source({ byId: {} }), workspaceStore: source({ items: [], archivedSessionIds: [] }), archivedSessionMetadata: async () => ({ items: [] }),
+    trashedSessions: async () => ({ retentionDays: 30, items: [item] }),
+    restoreTrashedSessions: async () => ({ restoredSessionIds: [], skippedSessionIds: [], failures: [] }),
+    purgeTrashedSessions: async input => { calls.push(input); return { purgedSessionIds: [item.sessionId], failures: [] }; },
+    t: key => key
+  };
+  const nodes = node => Array.isArray(node) ? node.flatMap(nodes) : node?.props ? [node, ...nodes(node.props.children)] : [];
+  let tree; const render = () => { cursor = 0; tree = client.__test.ArchivedSessionsSection(props); };
+  const modal = title => nodes(tree).find(node => node.props?.open === true && node.props?.title === title);
+  render();
+  nodes(tree).find(node => node.props?.["aria-label"] === "trash.open").props.onClick();
+  await tick(); render();
+  nodes(modal("trash.title").props.footer).find(node => node.props?.children === "trash.emptyTrash").props.onClick();
+  render();
+  const confirm = modal("trash.purgeAllTitle");
+  assert.ok(confirm);
+  assert.deepEqual(calls, []);
+  await nodes(confirm.props.footer).find(node => node.props?.children === "trash.purgeAllConfirm").props.onClick();
+  assert.deepEqual(calls, [{ all: true }]);
+});

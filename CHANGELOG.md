@@ -4,6 +4,19 @@
 
 Published release notes are retained below; new versions are added without removing earlier entries.
 
+## Unreleased
+
+- Add a disposable per-session full-text index keyed by a SHA-256 fingerprint of the session header, persistence revision, event count, and artifact size. Unchanged sessions avoid reopening transcripts, a post-read stat rejects stale writes, and missing, corrupt, or unwritable cache data transparently falls back to direct log reads. Remove cached text when sessions are trashed or permanently purged.
+- Add a 30-day recoverable Trash with restore and explicit permanent purge. Deletes move the transcript artifact into `$DSH_HOME/archive-manager/trash`, preserve the original path, archived membership, workspace position, and favorite state, and enforce a 100-session / 1 GiB limit. Expired entries are highlighted rather than auto-deleted; restore and purge reject path escapes, symbolic links, changed storage locations, and existing restore targets.
+- Require npm package integrity, ECDSA P-256 signature, signing-key validity, and SLSA v1 provenance consistency before displaying an update and again before installation. Pin installation to the verified exact version, automatically reinstall the current version after failure, and surface signature key plus source repository/commit in the update panel.
+- Render each large project group 200 sessions at a time with **Load more** appending the next batch. Search, filter, tab, sort, and date changes reset the window while select-all continues to target the complete filtered result set.
+- Read content search sessions with a bounded concurrency of four while preserving input order for both matches and failures, so one unreadable transcript is isolated instead of interrupting the rest of the batch.
+- Add unit and host-level regression coverage for bounded concurrency, ordered results, and per-session failure isolation.
+- Add regression coverage for index freshness and write-failure fallback, trash lifecycle/path and symlink safety, npm signature/provenance rejection, exact-version installation, automatic rollback, and progressive rendering.
+- Stabilize the cache-rebuild retry test and update plugin metadata coverage for the bundled SVG icon.
+- Update the English, Simplified Chinese, and Russian READMEs plus the English and Simplified Chinese changelogs for the new search, trash, update-security, and rendering behavior.
+- Run the regression suite on Windows, Linux, and macOS in CI.
+
 ## 1.1.17 - 2026-10-27
 
 - Full-row right-click context menu support in sidebar:

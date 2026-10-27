@@ -76,15 +76,15 @@ test("归档设置页原型支持筛选内全选、跨项目选择与确认批�
 	assert.match(client, /}, ArchivedSessionsSection\);/);
 });
 
-test("恢复和删除后刷新会话投影，使侧栏与宿主状态重新一致", async () => {
+test("恢复和移入回收站后刷新会话投影，使侧栏与宿主状态重新一致", async () => {
 	const client = await readFile(clientPath, "utf8");
 
 	assert.match(client, /const refreshSessionList = async \(\) =>/);
 	assert.match(client, /restored archived sessions but session list refresh failed/);
 	assert.match(client, /await unarchiveOne\(sessionId\);[\s\S]*await refreshSessionList\(\);/);
 	assert.match(client, /unarchiveSessionsViaOfficial\(ctx\.workspaces, sessionIds, refreshSessionList, unarchiveOne\)/);
-	assert.match(client, /await registry\.deleteSession\(sessionId\);[\s\S]*await refreshSessionList\(\);/);
-	assert.match(client, /await registry\.deleteArchivedSessions\(target\);[\s\S]*await refreshSessionList\(\);/);
+	assert.match(client, /await trashSession\(sessionId\);[\s\S]*await refreshSessionList\(\);/);
+	assert.match(client, /await trashArchivedSessions\(target\);[\s\S]*await refreshSessionList\(\);/);
 });
 
 test("创建时间排序从宿主归档头部读取元数据，更新时间继续使用客户端摘要", async () => {
@@ -157,14 +157,16 @@ test("单条恢复按会话阻止重复提交，并在请求结束后释放", as
   assert.match(client, /disabled: busy \|\| unarchivingSessionIds\.has\(session\.id\)/);
 });
 
-test("删除文案中英键齐全，并统一使用子代理用语", async () => {
+test("回收站文案三语键齐全，并统一使用子代理用语", async () => {
   const client = await readFile(clientPath, "utf8");
   assert.match(client, /"deleteSession.unknown": "会话已不存在或已被删除。"/);
   assert.match(client, /"deleteSession.unknown": "This session no longer exists or was already deleted."/);
-  assert.match(client, /"deleteSession.failed": "删除会话失败：{detail}"/);
-  assert.match(client, /"deleteSession.failed": "Could not delete the session: {detail}"/);
-  assert.match(client, /及其子代理（含正在运行的）/);
-  assert.match(client, /their child agents \(including any that are still running\)/);
+  assert.match(client, /"deleteSession.failed": "移入回收站失败：{detail}"/);
+  assert.match(client, /"deleteSession.failed": "Could not move the session to trash: {detail}"/);
+  assert.match(client, /"deleteSession.failed": "Не удалось переместить сессию в корзину: {detail}"/);
+  assert.match(client, /及其子代理移入回收站，可在 30 天内恢复/);
+  assert.match(client, /will be moved to Trash and can be restored for 30 days/);
+  assert.match(client, /будут перемещены в корзину и доступны для восстановления в течение 30 дней/);
   assert.doesNotMatch(client, /及其子会话和记录/);
   assert.match(client, /isUnknownSessionError\(reason\)/);
   assert.match(client, /"archives.archiveFailed": "归档失败：{detail}"/);

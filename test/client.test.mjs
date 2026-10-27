@@ -106,11 +106,14 @@ test("分叉失败向列表提示回调报告错误，成功时不提示", async
   assert.equal(messages.length, 1);
 });
 
-test("完整客户端中英文词条和占位符对应", () => {
-  assert.deepEqual(Object.keys(t.zh).sort(), Object.keys(t.en).sort());
-  for (const key of Object.keys(t.zh)) {
-    assert.deepEqual((t.zh[key].match(/\{\w+\}/g) ?? []).sort(), (t.en[key].match(/\{\w+\}/g) ?? []).sort(), key);
+test("完整客户端中英俄文词条和占位符对应", () => {
+  for (const locale of [t.en, t.ru]) {
+    assert.deepEqual(Object.keys(t.zh).sort(), Object.keys(locale).sort());
+    for (const key of Object.keys(t.zh)) {
+      assert.deepEqual((t.zh[key].match(/\{\w+\}/g) ?? []).sort(), (locale[key].match(/\{\w+\}/g) ?? []).sort(), key);
+    }
   }
+  assert.equal(t.ARCHIVE_RENDER_BATCH, 200);
 });
 
 function summary(id, extra = {}) {

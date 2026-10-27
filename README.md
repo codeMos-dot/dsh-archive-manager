@@ -26,6 +26,7 @@ This document describes **1.1.17**. See [Changelog](CHANGELOG.md) for published 
 Put inactive conversations away and find them again when needed, keeping everyday task lists tidy.
 
 - **Dual views & primary sidebar entry**: Toggleable persistent icon on the host's primary sidebar opens a **960px centered workspace view** for both Archived and Unarchived sessions, eliminating narrow dialog scrolling constraints.
+- **Progressive rendering for large lists**: Each project group renders 200 sessions at first, and **Load more** appends 200. Search, filter, tab, sort, or date changes reset the window; select-all still uses the complete filtered set.
 - **Full lifecycle session management**: Archive individual chats, all chats in a workspace, cross-project batches, and restore or open sessions seamlessly.
 - **Full-row sidebar right-click actions**: Right-click directly anywhere on sidebar workspace or session rows to trigger dedicated actions menus; passes through native system context menus on ungrouped or blank rows without accidental clicks.
 - **Zero-jitter star alignment (#90)**: Standardizes favorite stars to 16×16px size and overlays the host leading slot via absolute positioning, eliminating horizontal title jitter and custom skin conflicts (such as orca-link).
@@ -36,12 +37,13 @@ Put inactive conversations away and find them again when needed, keeping everyda
 - **Anti-bleedthrough modals & localized accessibility**: Mounts wide preview dialogs directly to body (`portalToBody`) with solid backing and frosted blur to prevent text bleedthrough; adds comprehensive trilingual close button accessibility labels (`common.close`).
 - **Standardized section ID & coexistence compatibility (#91)**: Section ID updated to `archive-manager` with runtime fail-soft `try/catch` protection, ensuring smooth coexistence with third-party archive plugins.
 - **Clean single-line adaptive toolbar**: Uses the host's native `Input` primitive with an official search icon and glowing green focus border, flexibly expanding to fill remaining width; arranged as search input, view filter/sort menu, project filter, and date range in a clean single line with strict box-model boundaries.
-- **Unified full-text search & Codex composite menu**: Search automatically covers both conversation titles and body history (including user and assistant messages) by default; consolidates session filtering (all / favorites only) and sorting into a two-section Codex-style menu with native checkmarks.
+- **Unified full-text search & Codex composite menu**: Search automatically covers both conversation titles and body history (including user and assistant messages) by default, with a revision-aware persistent index for unchanged transcripts; consolidates session filtering (all / favorites only) and sorting into a two-section Codex-style menu with native checkmarks.
 - **Lightweight DateRange capsule & calendar popover**: Completely replaces the native date input to eliminate dark-mode inversion and focus loss (#74); displays the selected range in a single line with a dedicated clear button; supports quick presets, localized English/Chinese/Russian typography, and full WAI-ARIA keyboard navigation (arrows, Home/End, PageUp/Down with month-end clamping) with real-time range stretch preview.
 - **Automated idle session cleanup**: Specify an idle threshold in days to discover inactive chats, automatically protecting running tasks, interactive prompts, and starred items, with instant undo support.
-- **Permanent deletion**: Thoroughly purge unwanted transcripts, cache rows, and indexes with per-item retry reporting.
+- **Native workspace menu integration**: Securely injects an **Archive session** action into the sidebar workspace `...` menu, anchoring an in-place frosted glass confirmation modal following the "what you see is what you archive" principle.
+- **Recoverable 30-day Trash & permanent purge**: Move unwanted sessions into a bounded Trash instead of erasing them immediately. Restore returns them to their original path plus archived, workspace, and favorite state; permanent purge requires explicit confirmation and thoroughly removes transcripts, cache rows, and indexes with per-item retry reporting.
 - **Orphan subagent detection & cleanup**: Automatically detect residue subagents whose parent sessions were externally deleted, displaying disk usage and enabling safe one-click reclamation.
-- **Controlled online updates & reverse proxy ready**: Features a toggleable online update switch, enterprise host-level configuration locking, and native baseURI dynamic endpoint resolution for prefix-stripping reverse proxies.
+- **Verified online updates with rollback**: Checks npm integrity, package signatures, and SLSA v1 provenance before showing and again before installing a pinned exact version; a failed install automatically reinstalls the current version and reports the rollback result. Also features a toggleable update switch, enterprise configuration locking, and reverse-proxy-ready baseURI resolution.
 
 ## Manual list-cache rebuild (#88)
 
@@ -53,14 +55,21 @@ No old plugin domains are scanned, no JSON is copied, no Session/Agent is activa
 
 When parent sessions are deleted externally or via the host, orphaned subagents may remain on disk. The Archive Manager detects these orphan sessions in the Organizer panel, calculates disk space usage, and provides one-click physical deletion.
 
+## Recoverable deletion and Trash
+
+Deleting a session moves its transcript artifact into `$DSH_HOME/archive-manager/trash/<encoded-id>-<uuid>/` instead of erasing it immediately. Each entry records the original path, archived membership, workspace position, and favorite state so a restore can put the session back where it was; active archive, workspace, and favorite bookkeeping is removed while the item remains in Trash.
+
+Entries receive a 30-day retention deadline. Expired entries are highlighted, not removed automatically. Use explicit **Permanently delete selected** or **Empty Trash** actions to reclaim disk space; permanent purge cannot be undone. Trash holds at most 100 sessions and 1 GiB in total. Restore and purge reject paths outside the Trash root, symbolic-link entries, changed storage locations, or an existing restore destination; a failed record stays available for retry.
+
 ## Search and preview
 
 - Archived and Unarchived share title/content search, project, favorites, updated-date filters, and creation-time sorting. Star or unstar conversations on either tab.
 - Search automatically covers both conversation titles and body history (including user and assistant messages) by default. Date filters include the entire local end date and combine with project and favorites.
 - Matches show snippets and highlights. On Archived, click a snippet or **More → Quick preview** to inspect context without restoring. On Unarchived, a snippet opens the full conversation.
 - Preview renders Markdown tables, quotes, and code blocks with role labels; switch to source text for highlights. It shows up to eight recent messages, or context around the first match. Each message is limited to 2,000 UTF-16 code units without splitting Unicode characters.
-- Search accepts up to 200 query characters and reads batches of at most 20 sessions, sequentially within each batch. Tools, attachments, reasoning, system messages, and plugin injections are excluded. Read failures remain visible and can be retried. Stored text is not the model's current context.
-- There is no persistent full-text index. Large or long conversations can be slow; narrow project, dates, or favorites first. No session-count or latency guarantee has been established. Changing filters prevents later batches and stale results, but cannot interrupt the batch already reading.
+- Search accepts up to 200 query characters and reads batches of at most 20 sessions, with up to four transcript reads in flight per batch while results retain request order. Tools, attachments, reasoning, system messages, and plugin injections are excluded. Read failures remain visible and can be retried. Stored text is not the model's current context.
+- Searchable text is cached in a disposable per-session index. Its SHA-256 fingerprint combines the session header, persistence revision, event count, and artifact size; unchanged sessions avoid reopening the transcript, while a second stat after reading prevents a stale index from being written. Missing, corrupt, or unwritable cache records transparently fall back to direct log reads.
+- The index accelerates repeat searches but does not preload every session or establish a latency guarantee. Narrow project, dates, or favorites first. Changing filters prevents later batches and stale results, but cannot interrupt the batch already reading.
 
 ## Screenshots
 
@@ -182,7 +191,7 @@ Compact project groups can be collapsed. Stars and restore/archive icons appear 
 
 ### View and continue archived conversations
 
-Native conversation navigation has been available since `0.1.40`; 1.0.0 uses these entry points:
+Native conversation navigation has been available since `0.1.40`; the current release uses these entry points:
 
 - **Click the session title**: open the native DSH session to view messages, attachments, and tool details. Continue chatting while keeping the session archived.
 - **More → Restore and open**: unarchive the session and open it to resume work.
@@ -196,6 +205,10 @@ The canonical API is `workspaceRegistry.searchSessionContent({ sessionIds, query
 ## Updates
 
 Click **Check for updates** in the archive management page header. DSH CLI or Desktop environments with automatic update support can update directly; other environments provide a manual command for the current profile. You can also rerun the installation command above.
+
+Before offering an update, and again immediately before installation, the host verifies the exact npm version through the official HTTPS registry: SHA-512 tarball integrity and registry origin, the npm ECDSA P-256 package signature and signing-key validity, plus an SLSA v1 provenance bundle bound to the package name, version, tarball digest, source repository, and commit. The provenance DSSE signature, certificate validity at the Rekor timestamp, and Rekor entry are checked as well. Installation is pinned to the verified `package@version`; if it fails, the host reinstalls the current version and reports whether rollback succeeded. The update panel shows the verification state, signer key, source repository, and source commit.
+
+The trust anchor is npm's official HTTPS registry and attestation service. This validates npm signature and provenance consistency; it is not an offline, full Sigstore root-chain and transparency-log inclusion-proof verifier.
 
 ## FAQ
 
@@ -220,7 +233,7 @@ The plugin neither replaces the official projection-cache table nor scans, valid
 
 ### How is archiving different from deletion?
 
-Archiving puts a conversation away so you can restore it later. **Permanent deletion cannot be undone** and may also remove that session's attachments. It does not delete your project working directory. Deletion requires confirmation.
+Archiving puts a conversation away so you can restore it later. Deleting moves its session artifact into Trash for 30 days, preserving its original location and list state for restore. **Permanent purge from Trash cannot be undone** and may also remove that session's attachments; neither action deletes your project working directory.
 
 ### Can I use it with Codex UI?
 
